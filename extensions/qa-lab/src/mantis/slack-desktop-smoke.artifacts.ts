@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import path from "node:path";
+import { walkRootDirectory } from "openclaw/plugin-sdk/root-walk";
 import { root } from "openclaw/plugin-sdk/security-runtime";
 import { isRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
 
@@ -316,8 +317,8 @@ export async function createSlackDesktopArtifactOwner(params: {
         scenarioIds: params.scenarioIds,
       }),
     async publish() {
-      // Each invocation validates its own staging area. Public paths retain the
-      // existing latest-publisher contract, not an atomic directory snapshot.
+      // Verdicts use each run's staging area. Shared published paths can interleave
+      // across runs; coherent concurrent bundles need separate output directories.
       for (const file of ownedFiles) {
         if (await destination.exists(file)) {
           if (!(await destination.stat(file)).isFile) {
@@ -326,11 +327,11 @@ export async function createSlackDesktopArtifactOwner(params: {
           await destination.remove(file);
         }
       }
-      for await (const entry of evidence.walk(".", {
+      for await (const entry of walkRootDirectory(stagingDir, ".", {
         symlinkPolicy: "skip",
         limitBehavior: "throw",
-        entryFilter: (entry) =>
-          [summaryFile, reportFile, "error.txt"].includes(entry.relativePath)
+        entryFilter: (candidate) =>
+          [summaryFile, reportFile, "error.txt"].includes(candidate.relativePath)
             ? "skip-subtree"
             : "include",
       })) {

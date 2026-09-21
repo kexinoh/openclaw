@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { useAutoCleanupTempDirTracker } from "openclaw/plugin-sdk/test-env";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { useAutoCleanupTempDirTracker } from "../../../../test/helpers/temp-dir.js";
 import type { CommandRunner } from "./crabbox-runtime.js";
 import { runMantisSlackDesktopSmoke } from "./slack-desktop-smoke.runtime.js";
 import {
@@ -24,6 +24,14 @@ vi.mock("@openclaw/crabbox-provider/cli-runtime-api.js", async (importOriginal) 
 const selected = "slack-approval-plugin-native";
 const unselected = "slack-approval-exec-native";
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
+
+function createBarrier() {
+  let complete: () => void;
+  const promise = new Promise<void>((resolve) => {
+    complete = resolve;
+  });
+  return { promise, resolve: () => complete() };
+}
 
 function createRunner(
   copy: (outputDir: string, run: number) => Promise<void>,
@@ -101,8 +109,8 @@ describe("Mantis Slack artifact ownership", () => {
   }
 
   it("keeps overlapping runs from accepting each other's artifacts", async () => {
-    const copied = Promise.withResolvers<void>();
-    const release = Promise.withResolvers<void>();
+    const copied = createBarrier();
+    const release = createBarrier();
     const firstRun = runMantisSlackDesktopSmoke(
       options(
         createRunner(async (outputDir) => {

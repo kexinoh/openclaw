@@ -43,10 +43,10 @@ Never bake secrets, browser cookies, Slack login state, repository checkouts,
 `node_modules`, or `dist/` into a provider image.
 
 Reusing `--output-dir` replaces the current run's evidence while preserving unrelated
-diagnostics and unselected approval checkpoints. Each run validates its own incoming
-artifacts before reporting success. Use separate output directories for concurrent
-runs when you need complete per-run bundles: shared published paths show the latest
-publisher and are not an atomic directory snapshot.
+diagnostics and unselected approval checkpoints. Each run determines its verdict from
+its own staged incoming artifacts. Concurrent runs sharing fixed output paths can
+interleave files and summaries. Concurrent runs must use separate output directories
+when they need coherent per-run bundles.
 
 ## GitHub dispatch
 
