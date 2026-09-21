@@ -761,7 +761,9 @@ describe("PR refresh wire ownership", () => {
       spaced,
     }) => {
       vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
-      onTestFinished(() => vi.useRealTimers());
+      onTestFinished(() => {
+        vi.useRealTimers();
+      });
       const sessions = makeChatHost().sessions;
       onTestFinished(() => sessions.dispose());
       const { pane, state, request, emitGatewayEvent } = createPullRequestPane(sessions);
