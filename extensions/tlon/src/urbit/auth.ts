@@ -10,6 +10,7 @@ type UrbitAuthenticateOptions = {
   ssrfPolicy?: SsrFPolicy;
   lookupFn?: LookupFn;
   fetchImpl?: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
+  beforeRequest?: () => void;
   timeoutMs?: number;
 };
 
@@ -29,6 +30,7 @@ export async function authenticate(
     ssrfPolicy: options.ssrfPolicy,
     lookupFn: options.lookupFn,
     fetchImpl: options.fetchImpl,
+    beforeRequest: options.beforeRequest,
     timeoutMs: options.timeoutMs ?? 15_000,
     maxRedirects: 3,
     auditContext: "tlon-urbit-login",
@@ -36,7 +38,6 @@ export async function authenticate(
 
   try {
     if (!response.ok) {
-      await response.body?.cancel().catch(() => undefined);
       throw new UrbitAuthError("auth_failed", `Login failed with status ${response.status}`);
     }
 

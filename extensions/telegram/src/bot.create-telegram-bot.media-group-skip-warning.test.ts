@@ -1,5 +1,6 @@
 // Telegram tests cover bot.create telegram bot.media group skip warning plugin behavior.
-import { setTimeout as delay } from "node:timers/promises";
+import { coerceErrorMessage } from "openclaw/plugin-sdk/error-runtime";
+import type { SavedRemoteMedia } from "openclaw/plugin-sdk/media-runtime";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { telegramBotInfoForTest } from "./bot.create-telegram-bot.test-support.js";
 
@@ -21,7 +22,7 @@ vi.mock("./bot/delivery.resolve-media.runtime.js", async () => {
   );
   return {
     readRemoteMediaBuffer: (...args: unknown[]) => readRemoteMediaBuffer(...args),
-    formatErrorMessage: (err: unknown) => (err instanceof Error ? err.message : String(err)),
+    formatErrorMessage: coerceErrorMessage,
     logVerbose: () => {},
     MediaFetchError: actual.MediaFetchError,
     resolveTelegramApiBase: (apiRoot?: string) =>
@@ -100,15 +101,19 @@ function resolveFlushTimer(setTimeoutSpy: ReturnType<typeof vi.spyOn>) {
   return flushTimer;
 }
 
-async function waitForBufferedProcessing() {
-  await delay(75);
-}
-
 async function flushChannelPostMediaGroup(setTimeoutSpy: ReturnType<typeof vi.spyOn>) {
+  const replyDispatched = new Promise<void>((resolve) => {
+    const previousReply = replySpy.getMockImplementation();
+    replySpy.mockImplementationOnce(async (...args) => {
+      const result = await previousReply?.(...args);
+      resolve();
+      return result;
+    });
+  });
   const flushTimer = resolveFlushTimer(setTimeoutSpy);
   expect(flushTimer).toBeTypeOf("function");
   await flushTimer?.();
-  await waitForBufferedProcessing();
+  await replyDispatched;
 }
 
 function createChannelPostContext(params: {
@@ -125,10 +130,21 @@ function createChannelPostContext(params: {
       date: params.date,
       ...(params.caption ? { caption: params.caption } : {}),
       media_group_id: params.mediaGroupId,
-      photo: [{ file_id: params.photoFileId }],
+      photo: [
+        {
+          file_id: params.photoFileId,
+          file_unique_id: `unique-${params.photoFileId}`,
+          width: 1,
+          height: 1,
+        },
+      ],
     },
     me: { username: "openclaw_bot" },
-    getFile: async () => ({ file_path: `photos/${params.photoFileId}.jpg` }),
+    getFile: async () => ({
+      file_id: params.photoFileId,
+      file_unique_id: `unique-${params.photoFileId}`,
+      file_path: `photos/${params.photoFileId}.jpg`,
+    }),
   };
 }
 
@@ -188,7 +204,12 @@ describe("createTelegramBot media-group skip warning (#55216)", () => {
     saveRemoteMedia.mockImplementation(async (...args: unknown[]) => {
       const url = urlOf(args);
       if (url.includes("photos/p1.jpg")) {
-        return { path: "/tmp/p1.jpg", contentType: "image/png" };
+        return {
+          id: "p1.jpg",
+          path: "/tmp/p1.jpg",
+          size: 4,
+          contentType: "image/png",
+        } satisfies SavedRemoteMedia;
       }
       throw new MediaFetchError("fetch_failed", `Failed to fetch media from ${url}`);
     });
@@ -205,7 +226,7 @@ describe("createTelegramBot media-group skip warning (#55216)", () => {
       expect(sendMessageSpy).not.toHaveBeenCalled();
       await flushChannelPostMediaGroup(setTimeoutSpy);
 
-      await vi.waitFor(() => expect(sendMessageSpy).toHaveBeenCalledTimes(1));
+      expect(sendMessageSpy).toHaveBeenCalledTimes(1);
       expect(sendMessageSpy).toHaveBeenCalledWith(
         CHANNEL_ID,
         expect.stringContaining("1 of 2 images"),
@@ -218,7 +239,7 @@ describe("createTelegramBot media-group skip warning (#55216)", () => {
       );
       const warningText = String(sendMessageSpy.mock.calls[0]?.[1]);
       expect(warningText).toContain("1 could not be fetched and was skipped");
-      await vi.waitFor(() => expect(replySpy).toHaveBeenCalled());
+      expect(replySpy).toHaveBeenCalled();
       expect(replySpy.mock.calls[0]?.[0]?.media).toEqual([
         expect.objectContaining({ path: "/tmp/p1.jpg", contentType: "image/png" }),
         expect.objectContaining({ kind: "image" }),
@@ -245,7 +266,7 @@ describe("createTelegramBot media-group skip warning (#55216)", () => {
       });
       await flushChannelPostMediaGroup(setTimeoutSpy);
 
-      await vi.waitFor(() => expect(sendMessageSpy).toHaveBeenCalledTimes(1));
+      expect(sendMessageSpy).toHaveBeenCalledTimes(1);
       const warningText = String(sendMessageSpy.mock.calls[0]?.[1]);
       expect(warningText).toContain("0 of 2 images");
       expect(warningText).toContain("2 could not be fetched and were skipped");
@@ -264,7 +285,12 @@ describe("createTelegramBot media-group skip warning (#55216)", () => {
     saveRemoteMedia.mockImplementation(async (...args: unknown[]) => {
       const url = urlOf(args);
       if (url.includes("photos/p1.jpg")) {
-        return { path: "/tmp/p1.jpg", contentType: "image/png" };
+        return {
+          id: "p1.jpg",
+          path: "/tmp/p1.jpg",
+          size: 4,
+          contentType: "image/png",
+        } satisfies SavedRemoteMedia;
       }
       throw new MediaFetchError("fetch_failed", `Failed to fetch media from ${url}`);
     });
@@ -280,7 +306,7 @@ describe("createTelegramBot media-group skip warning (#55216)", () => {
       });
       await flushChannelPostMediaGroup(setTimeoutSpy);
 
-      await vi.waitFor(() => expect(sendMessageSpy).toHaveBeenCalledTimes(1));
+      expect(sendMessageSpy).toHaveBeenCalledTimes(1);
       const warningText = String(sendMessageSpy.mock.calls[0]?.[1]);
       expect(warningText).toContain("1 of 3 images");
       expect(warningText).toContain("2 could not be fetched and were skipped");

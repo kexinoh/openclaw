@@ -1,3 +1,4 @@
+import { isFrozenClawToolAllowPolicy } from "../claws/tool-policy-runtime.js";
 import type { ResolvedConversationCapabilityProfile } from "./conversation-capability-profile.js";
 import {
   applyToolPolicyPipeline,
@@ -25,6 +26,9 @@ function mergePolicyAllowlist<TPolicy extends ToolPolicyLike>(
   policy: TPolicy | undefined,
   alsoAllow: readonly string[] | undefined,
 ): TPolicy | undefined {
+  if (isFrozenClawToolAllowPolicy(policy)) {
+    return policy;
+  }
   return mergeAlsoAllowPolicy(policy, alsoAllow ? [...alsoAllow] : undefined);
 }
 
@@ -36,6 +40,7 @@ export function resolveConversationToolPolicies(params: {
   capabilityProfile: ResolvedConversationCapabilityProfile;
   additionalProfileAllow?: readonly string[];
   additionalPolicyAllow?: readonly string[];
+  additionalInheritedAllow?: readonly string[];
 }): ResolvedConversationToolPolicies {
   const policy = params.capabilityProfile.policy;
   const profileAllow = [
@@ -64,7 +69,10 @@ export function resolveConversationToolPolicies(params: {
     sandboxPolicy: mergePolicyAllowlist(policy.sandboxPolicy, params.additionalPolicyAllow),
     subagentPolicy: mergePolicyAllowlist(policy.subagentPolicy, params.additionalPolicyAllow),
     runtimeToolPolicy: policy.runtimeToolPolicyForInheritance,
-    inheritedToolPolicy: policy.inheritedToolPolicy,
+    inheritedToolPolicy: mergePolicyAllowlist(
+      policy.inheritedToolPolicy,
+      params.additionalInheritedAllow,
+    ),
   };
 }
 
@@ -142,4 +150,17 @@ export function projectConversationToolNames<TName extends string>(params: {
       includeRuntimeToolPolicy: true,
     }),
   }).map((tool) => tool.name);
+}
+
+export function isConversationToolAllowed(
+  capabilityProfile: ResolvedConversationCapabilityProfile,
+  toolName: string,
+): boolean {
+  return (
+    projectConversationToolNames({
+      capabilityProfile,
+      toolNames: [toolName],
+      warn: () => undefined,
+    }).length === 1
+  );
 }

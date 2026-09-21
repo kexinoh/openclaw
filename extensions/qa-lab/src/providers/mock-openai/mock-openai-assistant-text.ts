@@ -1,4 +1,3 @@
-// QA Lab mock provider assistant text fixtures.
 import { truncateUtf16Safe } from "openclaw/plugin-sdk/text-utility-runtime";
 import {
   type ResponsesInputItem,
@@ -11,9 +10,6 @@ import {
   QA_SUBAGENT_DIRECT_FALLBACK_MARKER,
   QA_IMAGE_GENERATION_PROMPT_RE,
   QA_SKILL_WORKSHOP_GIF_PROMPT_RE,
-  QA_SLACK_MPIM_HISTORY_RECALL_PROMPT_RE,
-  QA_SLACK_MPIM_HISTORY_SEED_PROMPT_RE,
-  buildSlackMpimHistoryBotReply,
   QA_TOOL_SEARCH_PROMPT_RE,
   QA_TOOL_SEARCH_FAILURE_PROMPT_RE,
 } from "./mock-openai-contracts.js";
@@ -28,19 +24,23 @@ import {
   shouldUseWhatsAppContactMarker,
   shouldUseWhatsAppStickerMarker,
   extractToolErrorForNamedCall,
-  isHeartbeatPrompt,
+  resolveHeartbeatPromptReply,
   readFirstMediaPath,
 } from "./mock-openai-directives.js";
 import {
   extractLastUserText,
+  extractMockSubagentContext,
+  splitMockConversationContext,
   extractToolOutput,
   extractLatestToolOutput,
-  extractSlackMpimRetainedBotNonce,
+  buildSlackMpimHistoryReply,
   extractAllUserTexts,
+  extractUserTurnTexts,
   extractAllRequestTexts,
-  extractLatestImageUserTurn,
+  extractCurrentImageRequest,
   parseToolOutputJson,
 } from "./mock-openai-input.js";
+import { readMockSubagentCompletion } from "./mock-openai-subagent-completion.js";
 import {
   extractRememberedFact,
   extractOrbitCode,
@@ -63,6 +63,66 @@ function readCompletedImageGenerationMediaPath(prompt: string): string | undefin
     return undefined;
   }
   return /^MEDIA:\s*([^\r\n]+)$/im.exec(completionEvent)?.[1]?.trim() || undefined;
+}
+
+export const QA_COMPACTION_RETRY_FINAL_MARKER = "Protocol note: replay unsafe after write.";
+
+function isCompactionRetryWritePatch(value: unknown): boolean {
+  if (typeof value !== "string") {
+    return false;
+  }
+  const lines = value.split(/\r?\n/);
+  for (let index = 0; index < lines.length - 1; index += 1) {
+    if (
+      lines[index] !== "--- compaction-retry-summary.txt" ||
+      lines[index + 1] !== "+++ compaction-retry-summary.txt"
+    ) {
+      continue;
+    }
+    let sectionEnd = lines.length;
+    for (let candidate = index + 2; candidate < lines.length - 1; candidate += 1) {
+      if (lines[candidate]?.startsWith("--- ") && lines[candidate + 1]?.startsWith("+++ ")) {
+        sectionEnd = candidate;
+        break;
+      }
+    }
+    if (lines.slice(index + 2, sectionEnd).includes("+Replay safety: unsafe after write.")) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export function isCanonicalCompactionRetryWriteResult(toolOutput: string): boolean {
+  if (
+    /^Successfully wrote \d+ bytes to compaction-retry-summary\.txt\.?$/i.test(toolOutput.trim())
+  ) {
+    return true;
+  }
+  const parsed = parseToolOutputJson(toolOutput);
+  if (!parsed || parsed.status !== "completed" || parsed.replaySafe !== false) {
+    return false;
+  }
+  const value = parsed.value;
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const result = value as Record<string, unknown>;
+  return (
+    result.changed === true &&
+    result.created === true &&
+    result.firstChangedLine === 1 &&
+    isCompactionRetryWritePatch(result.patch)
+  );
+}
+
+export function readForkedContextCompletion(input: ResponsesInputItem[]) {
+  const completion = readMockSubagentCompletion(input, "qa-fork-context");
+  if (!completion) {
+    return undefined;
+  }
+  const result = /^FORKED-CONTEXT-CHILD: FORKED-CONTEXT-[A-Z0-9-]+$/m.exec(completion.result);
+  return completion.ok && result ? result[0] : "FORKED-CONTEXT-MISSING-RESULT";
 }
 
 export function buildAssistantText(input: ResponsesInputItem[], body: Record<string, unknown>) {
@@ -91,7 +151,7 @@ export function buildAssistantText(input: ResponsesInputItem[], body: Record<str
         .filter((value): value is string => typeof value === "string")
         .join("\n")
     : "";
-  const userTexts = extractAllUserTexts(input);
+  const userTexts = extractUserTurnTexts(input);
   const allInputText = extractAllRequestTexts(input, body);
   const rememberedFact = extractRememberedFact(userTexts);
   const model = typeof body.model === "string" ? body.model : "";
@@ -116,7 +176,7 @@ export function buildAssistantText(input: ResponsesInputItem[], body: Record<str
   const userExactMarkerDirective =
     promptExactMarkerDirective ?? extractExactMarkerDirective(allUserText);
   const exactReplyDirective = promptExactReplyDirective ?? extractExactReplyDirective(allInputText);
-  const latestImageUserTurn = extractLatestImageUserTurn(input);
+  const currentImageRequest = extractCurrentImageRequest(input, body);
   const whatsAppLocationMarker = shouldUseWhatsAppLocationMarker(prompt)
     ? extractWhatsAppLocationMarkerDirective(allInputText)
     : "";
@@ -136,17 +196,9 @@ export function buildAssistantText(input: ResponsesInputItem[], body: Record<str
     toolJson,
   });
 
-  const slackMpimHistoryRecall = QA_SLACK_MPIM_HISTORY_RECALL_PROMPT_RE.exec(prompt);
-  if (slackMpimHistoryRecall) {
-    const [, botReplyPrefix, recalledMarker, missingMarker] = slackMpimHistoryRecall;
-    const nonce = botReplyPrefix
-      ? extractSlackMpimRetainedBotNonce(prompt, botReplyPrefix)
-      : undefined;
-    return nonce && recalledMarker ? `${recalledMarker}_${nonce}` : (missingMarker ?? "");
-  }
-  const slackMpimHistorySeed = QA_SLACK_MPIM_HISTORY_SEED_PROMPT_RE.exec(prompt)?.[1];
-  if (slackMpimHistorySeed) {
-    return buildSlackMpimHistoryBotReply(slackMpimHistorySeed);
+  const slackMpimHistoryReply = buildSlackMpimHistoryReply(prompt);
+  if (slackMpimHistoryReply !== undefined) {
+    return slackMpimHistoryReply;
   }
   if (/what was the qa canary code/i.test(prompt) && rememberedFact) {
     return `Protocol note: the QA canary code was ${rememberedFact}.`;
@@ -163,18 +215,19 @@ export function buildAssistantText(input: ResponsesInputItem[], body: Record<str
   if (/memory unavailable check/i.test(prompt)) {
     return "Protocol note: I checked the available runtime context but could not confirm the hidden memory-only fact, so I will not guess.";
   }
-  if (isHeartbeatPrompt(prompt)) {
-    return "HEARTBEAT_OK";
+  const heartbeatReply = resolveHeartbeatPromptReply(prompt);
+  if (heartbeatReply) {
+    return heartbeatReply;
   }
   if (
-    /roundtrip image inspection check/i.test(latestImageUserTurn.text) &&
-    latestImageUserTurn.imageInputCount > 0
+    /roundtrip image inspection check/i.test(currentImageRequest.text) &&
+    currentImageRequest.imageInputCount > 0
   ) {
     return "Protocol note: the generated attachment shows the same QA lighthouse scene from the previous step.";
   }
   if (
-    /image understanding check/i.test(latestImageUserTurn.text) &&
-    latestImageUserTurn.imageInputCount > 0
+    /image understanding check/i.test(currentImageRequest.text) &&
+    currentImageRequest.imageInputCount > 0
   ) {
     return "Protocol note: the attached image is split horizontally, with red on top and blue on the bottom.";
   }
@@ -313,29 +366,25 @@ export function buildAssistantText(input: ResponsesInputItem[], body: Record<str
   if (QA_SUBAGENT_DIRECT_FALLBACK_WORKER_RE.test(prompt)) {
     return QA_SUBAGENT_DIRECT_FALLBACK_MARKER;
   }
-  if (/report the visible code/i.test(prompt) && /FORKED-CONTEXT-ALPHA/i.test(allInputText)) {
-    return "FORKED-CONTEXT-ALPHA";
+  const forkTask = extractMockSubagentContext(input);
+  if (forkTask && /^Report the visible code from the requester transcript\./i.test(forkTask.task)) {
+    const parent = forkTask.inheritedUserTexts.findLast((text) =>
+      /forked subagent context qa check/i.test(text),
+    );
+    const inheritedCode =
+      /The visible code in this current conversation is (FORKED-CONTEXT-[A-Z0-9-]+)\./.exec(
+        parent ?? "",
+      )?.[1];
+    return inheritedCode && !forkTask.task.includes(inheritedCode)
+      ? `FORKED-CONTEXT-CHILD: ${inheritedCode}`
+      : "FORKED-CONTEXT-MISSING-HISTORY";
   }
-  if (
-    /forked subagent context qa check/i.test(prompt) &&
-    /FORKED-CONTEXT-ALPHA/i.test(allInputText)
-  ) {
-    return [
-      "Worked",
-      "- FORKED-CONTEXT-ALPHA",
-      "Evidence",
-      "- The forked child recovered the visible code from requester transcript context.",
-      "Blocked",
-      "- None.",
-    ].join("\n");
+  const forkCompletion = readForkedContextCompletion(input);
+  if (forkCompletion) {
+    return forkCompletion;
   }
-  if (
-    toolOutput &&
-    (/delegate (?:one |a )bounded qa task/i.test(allInputText) ||
-      /subagent handoff/i.test(allInputText))
-  ) {
-    const compact = toolOutput.replace(/\s+/g, " ").trim() || "no delegated output";
-    return `Delegated task:\n- Inspect the QA workspace via a bounded subagent.\nResult:\n- ${compact}\nEvidence:\n- The child result was folded back into the main thread exactly once.`;
+  if (/forked subagent context qa check/i.test(splitMockConversationContext(prompt).current)) {
+    return "Waiting for the forked child to recover the visible code.";
   }
   if (toolOutput && /worked, failed, blocked|worked\/failed\/blocked|follow-up/i.test(prompt)) {
     return `Worked:\n- Read seeded QA material.\n- Expanded the report structure.\nFailed:\n- None observed in mock mode.\nBlocked:\n- No live provider evidence in this lane.\nFollow-up:\n- Re-run with a real model for qualitative coverage.`;
@@ -351,13 +400,8 @@ export function buildAssistantText(input: ResponsesInputItem[], body: Record<str
     (/compaction retry mutating tool check/i.test(allInputText) ||
       /compaction-retry-summary\.txt/i.test(toolOutput))
   ) {
-    if (
-      toolOutput.includes("Replay safety: unsafe after write.") ||
-      /compaction-retry-summary\.txt/i.test(toolOutput) ||
-      /successfully (?:wrote|replaced)/i.test(toolOutput) ||
-      /\bwrote\b.*\bcompaction-retry-summary\.txt\b/i.test(toolOutput)
-    ) {
-      return "Protocol note: replay unsafe after write.";
+    if (isCanonicalCompactionRetryWriteResult(toolOutput)) {
+      return QA_COMPACTION_RETRY_FINAL_MARKER;
     }
     return "";
   }
@@ -370,6 +414,22 @@ export function buildAssistantText(input: ResponsesInputItem[], body: Record<str
     .filter(Boolean)
     .join(",");
   const askUserNote = /^Note:\s*(.+)$/m.exec(askUserResult)?.[1]?.trim();
+  if (
+    toolOutput &&
+    /"status"\s*:\s*"answered"/.test(askUserResult) &&
+    /\bask_user_fixture=single\b/i.test(allInputText) &&
+    askUserDeploy
+  ) {
+    return `ASK-USER-SINGLE-OK | deploy=${askUserDeploy}`;
+  }
+  if (
+    toolOutput &&
+    /"status"\s*:\s*"answered"/.test(askUserResult) &&
+    /\bask_user_fixture=multi\b/i.test(allInputText) &&
+    askUserChecks
+  ) {
+    return `ASK-USER-MULTI-OK | checks=${askUserChecks}`;
+  }
   if (
     toolOutput &&
     /"status"\s*:\s*"answered"/.test(askUserResult) &&

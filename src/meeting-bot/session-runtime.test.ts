@@ -1,7 +1,12 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { coerceErrorMessage } from "@openclaw/normalization-core/error-coercion";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  closeOpenClawStateDatabaseAsync,
+  closeOpenClawStateDatabaseForTest,
+} from "../state/openclaw-state-db.js";
 import { TranscriptsStore } from "../transcripts/store.js";
 import { createMeetingSession } from "./session-factory.js";
 import { MeetingSessionRuntime, type MeetingSessionRuntimeJoinContext } from "./session-runtime.js";
@@ -134,7 +139,7 @@ function createTestRuntime(params: {
   >({
     logger: { debug: vi.fn(), error: vi.fn(), info: vi.fn(), warn: vi.fn() },
     logScope: "[meeting-test]",
-    formatError: (error) => (error instanceof Error ? error.message : String(error)),
+    formatError: coerceErrorMessage,
     messages: {
       previousBrowserLeaveFailed: "previous leave failed",
       reassignedSessionNote: "reassigned",
@@ -227,6 +232,8 @@ const tempDirs: string[] = [];
 
 afterEach(async () => {
   vi.useRealTimers();
+  await closeOpenClawStateDatabaseAsync();
+  closeOpenClawStateDatabaseForTest();
   await Promise.all(tempDirs.splice(0).map((dir) => fs.rm(dir, { force: true, recursive: true })));
 });
 

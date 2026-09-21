@@ -1,4 +1,3 @@
-// Telegram plugin module implements telegram ingress worker behavior.
 import { Worker } from "node:worker_threads";
 import type { TelegramNetworkConfig } from "openclaw/plugin-sdk/config-contracts";
 
@@ -22,6 +21,8 @@ export type TelegramIngressWorkerMessage =
       message: string;
       /** Telegram Bot API error_code (e.g. 409 for getUpdates conflicts). */
       errorCode?: number;
+      /** Actual server-directed flood wait currently being honored by the worker. */
+      retryAfterMs?: number;
       finishedAt: number;
     }
   | {

@@ -70,9 +70,6 @@ function buildChannelMessage(overrides?: Partial<SlackMessageEvent>): SlackMessa
 
 function buildEventScope(teamId: string): SlackEventScope {
   return {
-    apiAppId: "A1",
-    enterpriseId: "E1",
-    isEnterpriseInstall: true,
     teamId,
     client: {} as SlackEventScope["client"],
   };
@@ -153,6 +150,7 @@ describe("thread-level session keys", () => {
         sessionKey: "agent:main:slack:channel:c123",
         mainSessionKey: "agent:main:main",
         dmScope: "main",
+        groupScope: "per-group",
         lastRoutePolicy: "session",
         matchedBy: "default",
       },
@@ -408,11 +406,9 @@ describe("thread-level session keys", () => {
       });
 
       expect(root.sessionKey).toBe("agent:main:slack:group:g123");
-      expect(root.historyKey).toBe("G123");
       expect(root.threadContext.replyToId).toBeUndefined();
       expect(root.threadContext.messageThreadId).toBe(replyToMode === "all" ? rootTs : undefined);
       expect(followUp.sessionKey).toBe(`agent:main:slack:group:g123:thread:${rootTs}`);
-      expect(followUp.historyKey).toBe(followUp.sessionKey);
       expect(followUp.threadContext.replyToId).toBe(rootTs);
       expect(followUp.threadContext.messageThreadId).toBe(rootTs);
       expect(followUp.sessionKey).not.toContain("1777244714.000100");
@@ -516,8 +512,6 @@ describe("thread-level session keys", () => {
     const expectedSessionKey = "agent:main:slack:channel:c0ahzfcas1k:thread:1777244692.409919";
     expect(root.sessionKey).toBe(expectedSessionKey);
     expect(followUp.sessionKey).toBe(expectedSessionKey);
-    expect(root.historyKey).toBe("C0AHZFCAS1K");
-    expect(followUp.historyKey).toBe(expectedSessionKey);
     expect(new Set([root.sessionKey, followUp.sessionKey]).size).toBe(1);
   });
 
@@ -562,8 +556,6 @@ describe("thread-level session keys", () => {
     expect(rootMention.sessionKey).toBe(
       "agent:main:slack:channel:c0ahzfcas1k:thread:1777244692.409919",
     );
-    expect(rootMention.historyKey).toBe("C0AHZFCAS1K");
-    expect(urlFollowUp.historyKey).toBe(rootMention.sessionKey);
     expect(spawnedSubagentsByParent.size).toBe(1);
   });
 

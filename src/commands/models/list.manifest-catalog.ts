@@ -1,19 +1,15 @@
-/** Manifest-backed model catalog row loaders for `openclaw models list`. */
+/** Static manifest rows for setup flows before a runtime owner exists. */
 import { normalizeModelCatalogProviderId } from "@openclaw/model-catalog-core/model-catalog-refs";
 import type { NormalizedModelCatalogRow } from "@openclaw/model-catalog-core/model-catalog-types";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { planEffectiveModelCatalogRows } from "../../model-catalog/index.js";
+import { isInstalledPluginEnabled } from "../../plugins/installed-plugin-index.js";
 import { loadManifestMetadataSnapshot } from "../../plugins/manifest-contract-eligibility.js";
 import type { PluginManifestRegistry } from "../../plugins/manifest-registry.js";
 import type { PluginMetadataSnapshot } from "../../plugins/plugin-metadata-snapshot.types.js";
-import {
-  getPluginRecord,
-  isPluginEnabled,
-  resolvePluginContributionOwners,
-  type PluginRegistrySnapshot,
-} from "../../plugins/plugin-registry.js";
+import { resolvePluginContributionOwners } from "../../plugins/plugin-registry-contributions.js";
 
-function loadManifestCatalogRowsForPluginIds(params: {
+function planManifestCatalogRowsForPluginIds(params: {
   cfg: OpenClawConfig;
   registry: PluginManifestRegistry;
   pluginIds?: readonly string[];
@@ -37,42 +33,7 @@ function loadManifestCatalogRowsForPluginIds(params: {
   }).rows;
 }
 
-function resolveConventionModelCatalogPluginIds(params: {
-  cfg: OpenClawConfig;
-  index: PluginRegistrySnapshot;
-  providerFilter: string;
-}): readonly string[] {
-  const record = getPluginRecord({
-    index: params.index,
-    pluginId: params.providerFilter,
-  });
-  if (
-    !record ||
-    !isPluginEnabled({
-      index: params.index,
-      pluginId: record.pluginId,
-      config: params.cfg,
-    })
-  ) {
-    return [];
-  }
-  return [record.pluginId];
-}
-
-function resolveDeclaredModelCatalogPluginIds(params: {
-  cfg: OpenClawConfig;
-  index: PluginRegistrySnapshot;
-  providerFilter: string;
-}): readonly string[] {
-  return resolvePluginContributionOwners({
-    index: params.index,
-    config: params.cfg,
-    contribution: "modelCatalogProviders",
-    matches: params.providerFilter,
-  });
-}
-
-/** Loads authoritative static manifest catalog rows for model-list output. */
+/** Loads authoritative static rows without importing provider runtimes. */
 export function loadStaticManifestCatalogRowsForList(params: {
   cfg: OpenClawConfig;
   providerFilter?: string;
@@ -88,33 +49,32 @@ export function loadStaticManifestCatalogRowsForList(params: {
       config: params.cfg,
       env: params.env ?? process.env,
     });
-  const index = snapshot.index;
   if (!providerFilter) {
-    return loadManifestCatalogRowsForPluginIds({
+    return planManifestCatalogRowsForPluginIds({
       cfg: params.cfg,
       registry: snapshot.manifestRegistry,
     });
   }
-  const conventionRows = loadManifestCatalogRowsForPluginIds({
+  const conventionRows = planManifestCatalogRowsForPluginIds({
     cfg: params.cfg,
     registry: snapshot.manifestRegistry,
-    pluginIds: resolveConventionModelCatalogPluginIds({
-      cfg: params.cfg,
-      index,
-      providerFilter,
-    }),
+    pluginIds: isInstalledPluginEnabled(snapshot.index, providerFilter, params.cfg, params.env)
+      ? [providerFilter]
+      : [],
     providerFilter,
   });
   if (conventionRows.length > 0) {
     return conventionRows;
   }
-  return loadManifestCatalogRowsForPluginIds({
+  return planManifestCatalogRowsForPluginIds({
     cfg: params.cfg,
     registry: snapshot.manifestRegistry,
-    pluginIds: resolveDeclaredModelCatalogPluginIds({
-      cfg: params.cfg,
-      index,
-      providerFilter,
+    pluginIds: resolvePluginContributionOwners({
+      lookUpTable: snapshot,
+      config: params.cfg,
+      env: params.env,
+      contribution: "modelCatalogProviders",
+      matches: providerFilter,
     }),
     providerFilter,
   });

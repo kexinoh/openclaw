@@ -9,11 +9,16 @@ const mocks = vi.hoisted(() => ({
   configPath: "",
   workspace: "",
   nextConfig: undefined as unknown,
+  writeOptions: undefined as unknown,
   replaceConfigFile: vi.fn(),
 }));
 
 vi.mock("../../agents/workspace-templates.js", () => ({
   resolveWorkspaceTemplateSearchDirs: async () => [],
+}));
+
+vi.mock("../../agents/workspace-bootstrap-publish.js", () => ({
+  publishBootstrapFile: async () => true,
 }));
 
 vi.mock("../../agents/workspace.js", () => ({
@@ -48,9 +53,12 @@ describe("ensureDevGatewayConfig", () => {
     mocks.configPath = path.join(tempDir, "openclaw.json");
     mocks.workspace = path.join(tempDir, "workspace");
     mocks.nextConfig = undefined;
+    mocks.writeOptions = undefined;
     mocks.replaceConfigFile.mockReset();
     mocks.replaceConfigFile.mockImplementation(async (options: unknown) => {
-      mocks.nextConfig = (options as { nextConfig: unknown }).nextConfig;
+      const configOptions = options as { nextConfig: unknown; writeOptions?: unknown };
+      mocks.nextConfig = configOptions.nextConfig;
+      mocks.writeOptions = configOptions.writeOptions;
     });
   });
 
@@ -76,5 +84,6 @@ describe("ensureDevGatewayConfig", () => {
       },
     });
     expect(OpenClawSchema.safeParse(mocks.nextConfig).success).toBe(true);
+    expect(mocks.writeOptions).toEqual({ allowedAgentRosterRemovals: ["main"] });
   });
 });

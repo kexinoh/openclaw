@@ -1,9 +1,16 @@
-// Telegram tests cover delivery.resolve media retry plugin behavior.
 import { GrammyError } from "grammy";
-import type { Message } from "grammy/types";
+import { coerceErrorMessage } from "openclaw/plugin-sdk/error-runtime";
 import { sleepWithAbort } from "openclaw/plugin-sdk/runtime-env";
+// Telegram tests cover delivery.resolve media retry plugin behavior.
+import { createRequireRecord } from "openclaw/plugin-sdk/test-fixtures";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { resolveMedia } from "./delivery.resolve-media.js";
+import {
+  expectMediaFetchError,
+  expectRecordFields,
+  expectResolvedMediaFields,
+  makeCtx,
+} from "./delivery.resolve-media.test-helpers.js";
 import type { TelegramContext } from "./types.js";
 
 const saveMediaBuffer = vi.fn();
@@ -55,7 +62,7 @@ vi.mock("./delivery.resolve-media.runtime.js", () => {
   }
   return {
     readRemoteMediaBuffer: (...args: unknown[]) => readRemoteMediaBuffer(...args),
-    formatErrorMessage: (err: unknown) => (err instanceof Error ? err.message : String(err)),
+    formatErrorMessage: coerceErrorMessage,
     logVerbose: () => {},
     MediaFetchError,
     resolveTelegramApiBase: (apiRoot?: string) =>
@@ -78,85 +85,6 @@ vi.mock("../sticker-cache.js", () => ({
 
 const MAX_MEDIA_BYTES = 10_000_000;
 const FIXTURE = "fixture-token";
-
-function makeCtx(
-  mediaField: "voice" | "audio" | "photo" | "video" | "document" | "animation" | "sticker",
-  getFile: TelegramContext["getFile"],
-  opts?: { file_name?: string; mime_type?: string },
-): TelegramContext {
-  const msg: Record<string, unknown> = {
-    message_id: 1,
-    date: 0,
-    chat: { id: 1, type: "private" },
-  };
-  if (mediaField === "voice") {
-    msg.voice = {
-      file_id: "v1",
-      duration: 5,
-      file_unique_id: "u1",
-      ...(opts?.mime_type && { mime_type: opts.mime_type }),
-    };
-  }
-  if (mediaField === "audio") {
-    msg.audio = {
-      file_id: "a1",
-      duration: 5,
-      file_unique_id: "u2",
-      ...(opts?.file_name && { file_name: opts.file_name }),
-      ...(opts?.mime_type && { mime_type: opts.mime_type }),
-    };
-  }
-  if (mediaField === "photo") {
-    msg.photo = [{ file_id: "p1", width: 100, height: 100 }];
-  }
-  if (mediaField === "video") {
-    msg.video = {
-      file_id: "vid1",
-      duration: 10,
-      file_unique_id: "u3",
-      ...(opts?.file_name && { file_name: opts.file_name }),
-    };
-  }
-  if (mediaField === "document") {
-    msg.document = {
-      file_id: "d1",
-      file_unique_id: "u4",
-      ...(opts?.file_name && { file_name: opts.file_name }),
-      ...(opts?.mime_type && { mime_type: opts.mime_type }),
-    };
-  }
-  if (mediaField === "animation") {
-    msg.animation = {
-      file_id: "an1",
-      duration: 3,
-      file_unique_id: "u5",
-      width: 200,
-      height: 200,
-      ...(opts?.file_name && { file_name: opts.file_name }),
-    };
-  }
-  if (mediaField === "sticker") {
-    msg.sticker = {
-      file_id: "stk1",
-      file_unique_id: "ustk1",
-      type: "regular",
-      width: 512,
-      height: 512,
-      is_animated: false,
-      is_video: false,
-    };
-  }
-  return {
-    message: msg as unknown as Message,
-    me: {
-      id: 1,
-      is_bot: true,
-      first_name: "bot",
-      username: "bot",
-    } as unknown as TelegramContext["me"],
-    getFile,
-  };
-}
 
 function setupTransientGetFileRetry() {
   const getFile = vi
@@ -233,28 +161,7 @@ function resolveMediaWithDefaults(
   });
 }
 
-function requireResolvedMedia(
-  result: Awaited<ReturnType<typeof resolveMediaWithDefaults>>,
-  label: string,
-) {
-  if (!result) {
-    throw new Error(`expected ${label} media result`);
-  }
-  return result;
-}
-
-function requireRecord(value: unknown, label: string): Record<string, unknown> {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error(`expected ${label} to be a record`);
-  }
-  return value as Record<string, unknown>;
-}
-
-function expectRecordFields(record: Record<string, unknown>, fields: Record<string, unknown>) {
-  for (const [key, value] of Object.entries(fields)) {
-    expect(record[key]).toEqual(value);
-  }
-}
+const requireRecord = createRequireRecord("record", "expected-label-record");
 
 function requireReadRemoteMediaBufferParams(callIndex = 0): Record<string, unknown> {
   const call = (readRemoteMediaBuffer.mock.calls as unknown[][])[callIndex];
@@ -271,33 +178,6 @@ function expectReadRemoteMediaBufferFields(fields: Record<string, unknown>, call
 function expectFetchSsrfPolicyFields(fields: Record<string, unknown>, callIndex = 0) {
   const params = requireReadRemoteMediaBufferParams(callIndex);
   expectRecordFields(requireRecord(params.ssrfPolicy, "readRemoteMediaBuffer ssrfPolicy"), fields);
-}
-
-function expectResolvedMediaFields(
-  result: Awaited<ReturnType<typeof resolveMediaWithDefaults>>,
-  label: string,
-  fields: Record<string, unknown>,
-) {
-  expectRecordFields(requireResolvedMedia(result, label), fields);
-}
-
-async function expectMediaFetchError(
-  promise: Promise<unknown>,
-  fields: { code: string; messageIncludes: string; name?: string; status?: number },
-) {
-  try {
-    await promise;
-  } catch (error) {
-    const record = requireRecord(error, "MediaFetchError");
-    expect(record.name).toBe(fields.name ?? "MediaFetchError");
-    expect(record.code).toBe(fields.code);
-    expect(String(record.message)).toContain(fields.messageIncludes);
-    if (fields.status !== undefined) {
-      expect(record.status).toBe(fields.status);
-    }
-    return;
-  }
-  throw new Error("expected MediaFetchError rejection");
 }
 
 async function expectTransientGetFileRetrySuccess() {
@@ -357,6 +237,107 @@ describe("resolveMedia getFile retry", () => {
       expect(getFile).toHaveBeenCalledTimes(3);
     },
   );
+
+  it.each([
+    { errorCode: 400, description: "Bad Request: wrong file identifier/HTTP URL specified" },
+    { errorCode: 401, description: "Unauthorized" },
+    { errorCode: 403, description: "Forbidden" },
+    { errorCode: 404, description: "Not Found" },
+    { errorCode: 409, description: "Conflict" },
+  ])(
+    "does not retry permanent Telegram getFile rejection $errorCode",
+    async ({ errorCode, description }) => {
+      const error = new GrammyError(
+        "Call to 'getFile' failed!",
+        { ok: false, error_code: errorCode, description, parameters: {} },
+        "getFile",
+        {},
+      );
+      const getFile = vi.fn().mockRejectedValue(error);
+      const promise = resolveMediaWithDefaults(makeCtx("document", getFile));
+      const failure = expectMediaFetchError(promise, {
+        code: "http_error",
+        messageIncludes: "Telegram getFile failed after retries",
+        status: errorCode,
+      });
+
+      await flushRetryTimers();
+      await failure;
+
+      expect(getFile).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it.each([
+    {
+      mediaField: "document" as const,
+      filePath: "documents/file_42.pdf",
+      contentType: "application/pdf",
+    },
+    {
+      mediaField: "sticker" as const,
+      filePath: "stickers/file_0.webp",
+      contentType: "image/webp",
+    },
+  ])(
+    "retries temporarily unavailable Telegram $mediaField files reported as 400",
+    async ({ mediaField, filePath, contentType }) => {
+      const error = new GrammyError(
+        "Call to 'getFile' failed!",
+        {
+          ok: false,
+          error_code: 400,
+          description: "Bad Request: wrong file_id or the file is temporarily unavailable",
+          parameters: {},
+        },
+        "getFile",
+        {},
+      );
+      const getFile = vi.fn().mockRejectedValueOnce(error).mockResolvedValueOnce({
+        file_path: filePath,
+      });
+      const fileName = filePath.split("/").at(-1);
+      readRemoteMediaBuffer.mockResolvedValueOnce({
+        buffer: Buffer.from("media"),
+        contentType,
+        fileName,
+      });
+      saveMediaBuffer.mockResolvedValueOnce({
+        path: `/tmp/${fileName}`,
+        contentType,
+      });
+
+      const promise = resolveMediaWithDefaults(makeCtx(mediaField, getFile));
+      await flushRetryTimers();
+      const result = await promise;
+
+      expect(getFile).toHaveBeenCalledTimes(2);
+      expectResolvedMediaFields(result, `retried ${mediaField}`, {
+        path: `/tmp/${fileName}`,
+        kind: mediaField,
+      });
+    },
+  );
+
+  it.each([500, 502])("retries Telegram getFile server error %i", async (errorCode) => {
+    const error = new GrammyError(
+      "Call to 'getFile' failed!",
+      { ok: false, error_code: errorCode, description: "Server Error", parameters: {} },
+      "getFile",
+      {},
+    );
+    const getFile = vi
+      .fn()
+      .mockRejectedValueOnce(error)
+      .mockResolvedValueOnce({ file_path: "documents/file_42.pdf" });
+    mockPdfFetchAndSave("file_42.pdf");
+
+    const promise = resolveMediaWithDefaults(makeCtx("document", getFile));
+    await flushRetryTimers();
+    await promise;
+
+    expect(getFile).toHaveBeenCalledTimes(2);
+  });
 
   it("does not catch errors from readRemoteMediaBuffer (only getFile is retried)", async () => {
     const getFile = vi.fn().mockResolvedValue({ file_path: "voice/file_0.oga" });

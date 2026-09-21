@@ -126,6 +126,9 @@ describe("browser proxy upload transport", () => {
       uploadDir: nodeUploadDir,
     });
     const stagedPaths = (staged.body as { paths: string[] }).paths;
+    const canonicalStagedPaths = await Promise.all(
+      stagedPaths.map((filePath) => fs.realpath(filePath)),
+    );
 
     expect(stagedPaths).toHaveLength(1);
     expect(stagedPaths[0]?.startsWith(`${nodeUploadDir}${path.sep}`)).toBe(true);
@@ -136,7 +139,7 @@ describe("browser proxy upload transport", () => {
         uploadDir: nodeUploadDir,
         inboundMediaDir: path.join(nodeRoot, "inbound"),
       }),
-    ).resolves.toEqual({ ok: true, paths: stagedPaths });
+    ).resolves.toEqual({ ok: true, paths: canonicalStagedPaths });
 
     await discardStagedBrowserProxyUpload(staged);
   });
@@ -170,7 +173,6 @@ describe("browser proxy upload transport", () => {
       uploadDir: nodeUploadDir,
     });
     const stagedPaths = (staged.body as { paths: string[] }).paths;
-
     await expect(fs.stat(stagedPaths[0] ?? "")).resolves.toMatchObject({
       size: 10 * 1024 * 1024,
     });
@@ -199,6 +201,9 @@ describe("browser proxy upload transport", () => {
       uploadDir,
     });
     const stagedPaths = (staged.body as { paths: string[] }).paths;
+    const canonicalStagedPaths = await Promise.all(
+      stagedPaths.map((filePath) => fs.realpath(filePath)),
+    );
 
     expect(stagedPaths).toHaveLength(2);
     expect(stagedPaths.map((filePath) => path.basename(filePath))).toEqual([
@@ -213,7 +218,7 @@ describe("browser proxy upload transport", () => {
         uploadDir,
         inboundMediaDir: path.join(root, "inbound"),
       }),
-    ).resolves.toEqual({ ok: true, paths: stagedPaths });
+    ).resolves.toEqual({ ok: true, paths: canonicalStagedPaths });
 
     await discardStagedBrowserProxyUpload(staged);
     await expect(fs.stat(staged.directory ?? "")).rejects.toHaveProperty("code", "ENOENT");
@@ -280,6 +285,31 @@ describe("browser proxy upload transport", () => {
 
     expect(path.basename((staged.body as { paths: string[] }).paths[0] ?? "")).toBe("_COM¹.txt");
     await discardStagedBrowserProxyUpload(staged);
+  });
+
+  it("keeps staged names portable after byte truncation", async () => {
+    const root = await createTempRoot("openclaw-browser-proxy-truncate-");
+    const uploadDir = path.join(root, "uploads");
+    const stagedName = async (name: string): Promise<string> => {
+      const staged = await stageBrowserProxyUploadRequest({
+        method: "POST",
+        path: "/hooks/file-chooser",
+        body: {},
+        upload: {
+          envelope: BROWSER_PROXY_UPLOAD_ENVELOPE,
+          files: [{ name, contentBase64: "aGVsbG8=" }],
+        },
+        uploadDir,
+      });
+      const stagedPath = (staged.body as { paths: string[] }).paths[0] ?? "";
+      await discardStagedBrowserProxyUpload(staged);
+      return path.basename(stagedPath);
+    };
+
+    expect(await stagedName(`${"a".repeat(179)}.b`)).toBe("a".repeat(179));
+    expect(await stagedName(`${"b".repeat(179)} c`)).toBe("b".repeat(179));
+    expect(await stagedName(`${"c".repeat(175)}🦞.d`)).toBe(`${"c".repeat(175)}🦞`);
+    expect(await stagedName(`CON${" ".repeat(177)}x`)).toBe("_CON");
   });
 
   it("enforces retained byte and directory limits across concurrent requests", async () => {

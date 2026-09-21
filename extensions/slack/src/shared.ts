@@ -1,4 +1,3 @@
-// Slack plugin module implements shared behavior.
 import { describeAccountSnapshot } from "openclaw/plugin-sdk/account-helpers";
 import { adaptScopedAccountAccessor } from "openclaw/plugin-sdk/channel-config-helpers";
 import { isSlackPluginAccountConfigured } from "./account-configured.js";
@@ -88,21 +87,5 @@ export function createSlackPluginBase(params: {
       secretTargetRegistryEntries,
       collectRuntimeConfigAssignments,
     },
-  } as Pick<
-    ChannelPlugin<ResolvedSlackAccount>,
-    | "id"
-    | "meta"
-    | "setupWizard"
-    | "capabilities"
-    | "commands"
-    | "doctor"
-    | "agentPrompt"
-    | "streaming"
-    | "reload"
-    | "configSchema"
-    | "config"
-    | "setupContract"
-    | "security"
-    | "secrets"
-  >;
+  };
 }

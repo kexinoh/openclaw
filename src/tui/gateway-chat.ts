@@ -1,40 +1,64 @@
 // Bridges TUI chat requests to gateway session APIs.
 import { randomUUID } from "node:crypto";
+import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
+import { gatewayOriginScope } from "../../packages/gateway-client/src/gateway-origin-scope.js";
+import { startGatewayClientWhenEventLoopReady } from "../../packages/gateway-client/src/readiness.js";
 import {
   GATEWAY_CLIENT_CAPS,
   GATEWAY_CLIENT_MODES,
   GATEWAY_CLIENT_NAMES,
 } from "../../packages/gateway-protocol/src/client-info.js";
 import {
+  ConnectErrorDetailCodes,
+  readConnectErrorDetailCode,
+} from "../../packages/gateway-protocol/src/connect-error-details.js";
+import {
   type HelloOk,
+  type ArtifactsDownloadResult,
   MIN_CLIENT_PROTOCOL_VERSION,
   PROTOCOL_VERSION,
   type CommandEntry,
   type CommandsListParams,
   type CommandsListResult,
+  type QuestionGetResult,
+  type QuestionListResult,
+  type QuestionResolveParams,
+  type QuestionResolveResult,
   type SessionsListParams,
+  type SessionsResolveParams,
+  type SessionsResolveResult,
   type SessionsPatchResult,
   type SessionsPatchParams,
   type TaskSuggestionsAcceptResult,
   type TaskSuggestionsListResult,
 } from "../../packages/gateway-protocol/src/index.js";
+import { GATEWAY_SERVER_CAPS } from "../../packages/gateway-protocol/src/server-capabilities.js";
+import { isRetryableGatewayStartupUnavailableError } from "../../packages/gateway-protocol/src/startup-unavailable.js";
 import { getRuntimeConfig } from "../config/config.js";
-import type { OpenClawConfig } from "../config/types.openclaw.js";
+import type { ConfigFileSnapshot, OpenClawConfig } from "../config/types.openclaw.js";
 import { assertExplicitGatewayAuthModeWhenBothConfigured } from "../gateway/auth-mode-policy.js";
-import { resolveGatewayInteractiveSurfaceAuth } from "../gateway/auth-surface-resolution.js";
+import { buildGatewayConnectionDetails } from "../gateway/call.js";
 import {
-  buildGatewayConnectionDetails,
-  ensureExplicitGatewayAuth,
-  resolveExplicitGatewayAuth,
-} from "../gateway/call.js";
-import { startGatewayClientWhenEventLoopReady } from "../gateway/client-start-readiness.js";
+  resolveGatewayClientBootstrap,
+  resolveGatewayUrlOverride,
+} from "../gateway/client-bootstrap.js";
 import { GatewayClient, GatewayClientRequestError } from "../gateway/client.js";
+import { resolveExplicitGatewayAuth } from "../gateway/credentials.js";
+import {
+  gatewayEdgeAuthValueForTarget,
+  normalizeEdgeAuthHeadersConfig,
+  resolveEdgeAuthHeaders,
+  type EdgeAuthHeadersConfig,
+} from "../gateway/edge-auth.js";
+import { racePromiseWithAbortSignal } from "../infra/abort-signal.js";
+import { loadOriginDeviceToken } from "../infra/device-auth-store.js";
+import { loadDeviceIdentityIfPresent } from "../infra/device-identity.js";
 import { formatErrorMessage } from "../infra/errors.js";
 import { readActiveGatewayLockPort } from "../infra/gateway-lock.js";
+import { parseAgentSessionKey } from "../routing/session-key.js";
 import { roleScopesAllow } from "../shared/operator-scope-compat.js";
 import { sleep } from "../utils/sleep.js";
 import { VERSION } from "../version.js";
-import { TUI_SETUP_AUTH_SOURCE_CONFIG, TUI_SETUP_AUTH_SOURCE_ENV } from "./setup-launch-env.js";
 import type {
   ChatSendOptions,
   TuiAgentsList,
@@ -43,16 +67,22 @@ import type {
   TuiModelChoice,
   TuiApprovalDecision,
   TuiSessionList,
+  TuiSessionDescription,
   TuiSessionCreateOptions,
   TuiSessionMutationResult,
   TuiChatSendResult,
+  TuiImageRequest,
+  TuiImageData,
 } from "./tui-backend.js";
+import { isListedTuiSession } from "./tui-session-list-policy.js";
 
 type GatewayConnectionOptions = {
   url?: string;
   token?: string;
   password?: string;
   tlsFingerprint?: string;
+  allowConfiguredAuthForExactTarget?: boolean;
+  suppressEnvAuthFallback?: boolean;
 };
 
 type GatewayEvent = TuiEvent;
@@ -63,11 +93,12 @@ const STARTUP_CHAT_HISTORY_MAX_RETRY_MS = 5_000;
 
 type ResolvedGatewayConnection = {
   url: string;
+  deviceAuthScope?: string;
   token?: string;
   password?: string;
+  edgeAuthHeaders?: Readonly<Record<string, string>>;
   tlsFingerprint?: string;
   preauthHandshakeTimeoutMs?: number;
-  allowInsecureLocalOperatorUi: boolean;
 };
 
 function throwGatewayAuthResolutionError(reason: string): never {
@@ -104,8 +135,22 @@ function resolveStartupRetryDelayMs(err: GatewayClientRequestError): number {
   return Math.min(Math.max(retryAfterMs, 100), STARTUP_CHAT_HISTORY_MAX_RETRY_MS);
 }
 
-function nonEmptyString(value: unknown): string | undefined {
-  return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+async function hasStoredOriginDeviceAuth(deviceAuthScope: string): Promise<boolean> {
+  try {
+    const identity = loadDeviceIdentityIfPresent();
+    return Boolean(
+      identity &&
+      (
+        await loadOriginDeviceToken({
+          gatewayScope: deviceAuthScope,
+          deviceId: identity.deviceId,
+          role: "operator",
+        })
+      )?.token,
+    );
+  } catch {
+    return false;
+  }
 }
 
 function isLegacyPreserveSideRunsError(err: unknown): boolean {
@@ -127,9 +172,13 @@ function isLegacySucceedsParentError(err: unknown): boolean {
 type GatewaySessionList = TuiSessionList;
 type GatewayAgentsList = TuiAgentsList;
 type GatewayModelChoice = TuiModelChoice;
+type HandoffSessionResolveParams = Required<
+  Pick<SessionsResolveParams, "key" | "agentId" | "includeGlobal" | "allowMissing">
+>;
 
 export class GatewayChatClient implements TuiBackend {
   private client: GatewayClient;
+  private readonly historyLifetime = new AbortController();
   private readyPromise: Promise<void>;
   private resolveReady?: () => void;
   private pendingConnectError?: Error;
@@ -151,17 +200,17 @@ export class GatewayChatClient implements TuiBackend {
 
     this.client = new GatewayClient({
       url: connection.url,
+      ...(connection.deviceAuthScope ? { deviceAuthScope: connection.deviceAuthScope } : {}),
       token: connection.token,
       password: connection.password,
+      edgeAuthHeaders: connection.edgeAuthHeaders,
       tlsFingerprint: connection.tlsFingerprint,
       preauthHandshakeTimeoutMs: connection.preauthHandshakeTimeoutMs,
       clientName: GATEWAY_CLIENT_NAMES.TUI,
       clientDisplayName: "openclaw-tui",
       clientVersion: VERSION,
-      platform: process.platform,
       mode: GATEWAY_CLIENT_MODES.UI,
       scopes: ["operator.admin", "operator.read", "operator.write", "operator.approvals"],
-      deviceIdentity: connection.allowInsecureLocalOperatorUi ? null : undefined,
       caps: [
         GATEWAY_CLIENT_CAPS.AGENT_KIND,
         GATEWAY_CLIENT_CAPS.PLUGIN_APPROVALS,
@@ -171,6 +220,7 @@ export class GatewayChatClient implements TuiBackend {
       instanceId: randomUUID(),
       minProtocol: MIN_CLIENT_PROTOCOL_VERSION,
       maxProtocol: PROTOCOL_VERSION,
+      notifyOnStartupRetry: true,
       onHelloOk: (hello) => {
         this.pendingConnectError = undefined;
         this.hello = hello;
@@ -190,6 +240,11 @@ export class GatewayChatClient implements TuiBackend {
           this.resolveReady = resolve;
         });
         if (this.pendingConnectError && this.onConnectError) {
+          // Dedupe is per close-cycle: clearing here lets the next reconnect
+          // attempt report its own failure cause. Holding the guard until a
+          // successful hello froze the TUI on the first error forever (e.g. a
+          // later pairing-required failure and its approval hint never showed).
+          this.pendingConnectError = undefined;
           return;
         }
         this.onDisconnected?.(reason);
@@ -207,10 +262,10 @@ export class GatewayChatClient implements TuiBackend {
   }
 
   /** Connect to a target already selected and authenticated by a preceding Gateway probe. */
-  static connectBound(
+  static async connectBound(
     opts: GatewayConnectionOptions & { config: OpenClawConfig; url: string },
-  ): GatewayChatClient {
-    return new GatewayChatClient(resolveBoundGatewayConnection(opts));
+  ): Promise<GatewayChatClient> {
+    return new GatewayChatClient(await resolveBoundGatewayConnection(opts));
   }
 
   start() {
@@ -231,6 +286,20 @@ export class GatewayChatClient implements TuiBackend {
     if (this.pendingConnectError) {
       return;
     }
+    if (isRetryableGatewayStartupUnavailableError(error)) {
+      return;
+    }
+    if (
+      this.connection.deviceAuthScope &&
+      readConnectErrorDetailCode((error as Error & { details?: unknown }).details) ===
+        ConnectErrorDetailCodes.PAIRING_REQUIRED &&
+      !error.message.includes("Pairing request sent.")
+    ) {
+      error.message = [
+        error.message,
+        "Pairing request sent. Approve it in that gateway's Control UI (Settings -> Devices), or run `openclaw devices approve --latest` on the gateway host, then retry.",
+      ].join("\n");
+    }
     this.pendingConnectError = error;
     this.onConnectError?.(error);
   }
@@ -244,6 +313,7 @@ export class GatewayChatClient implements TuiBackend {
   }
 
   stop() {
+    this.historyLifetime.abort();
     // Keep TUI teardown ordered after the transport closes. Otherwise the
     // late close callback can re-arm UI timers after shutdown cleared them.
     return this.client.stopAndWait();
@@ -269,8 +339,8 @@ export class GatewayChatClient implements TuiBackend {
       timeoutMs: opts.timeoutMs,
       idempotencyKey: runId,
     });
-    const acceptedRunId = nonEmptyString(response?.runId) ?? runId;
-    const status = nonEmptyString(response?.status);
+    const acceptedRunId = normalizeOptionalString(response?.runId) ?? runId;
+    const status = normalizeOptionalString(response?.status);
     return status ? { runId: acceptedRunId, status } : { runId: acceptedRunId };
   }
 
@@ -305,8 +375,9 @@ export class GatewayChatClient implements TuiBackend {
   }
 
   async loadHistory(opts: { sessionKey: string; agentId?: string; limit?: number }) {
-    const startedAt = Date.now();
+    const deadline = Date.now() + STARTUP_CHAT_HISTORY_RETRY_TIMEOUT_MS;
     for (;;) {
+      this.historyLifetime.signal.throwIfAborted();
       try {
         return await this.client.request("chat.history", {
           sessionKey: opts.sessionKey,
@@ -314,19 +385,90 @@ export class GatewayChatClient implements TuiBackend {
           limit: opts.limit,
         });
       } catch (err) {
-        const withinStartupRetryWindow =
-          Date.now() - startedAt < STARTUP_CHAT_HISTORY_RETRY_TIMEOUT_MS;
-        if (withinStartupRetryWindow && isRetryableStartupUnavailable(err, "chat.history")) {
-          await sleep(resolveStartupRetryDelayMs(err));
-          continue;
+        if (Date.now() >= deadline || !isRetryableStartupUnavailable(err, "chat.history")) {
+          throw err;
         }
-        throw err;
+        await sleep(resolveStartupRetryDelayMs(err), this.historyLifetime.signal);
       }
     }
   }
 
+  async loadImage(opts: TuiImageRequest): Promise<TuiImageData> {
+    const { loadGatewayImage } = await import("./gateway-image-loader.js");
+    const signal = AbortSignal.any([opts.signal, this.historyLifetime.signal]);
+    const credentials = [
+      this.hello?.auth.deviceToken,
+      ...(this.hello?.auth.method === "password"
+        ? [this.connection.password, this.connection.token]
+        : [this.connection.token, this.connection.password]),
+    ].filter((value): value is string => Boolean(value));
+    return await loadGatewayImage({
+      request: { ...opts, signal },
+      connection: this.connection,
+      credentials: [...new Set(credentials)],
+      readMediaBasePath: async (requestSignal) => {
+        const snapshot = await this.client.request<Pick<ConfigFileSnapshot, "runtimeConfig">>(
+          "config.get",
+          {},
+          { signal: requestSignal },
+        );
+        return snapshot.runtimeConfig.gateway?.controlUi?.basePath ?? "";
+      },
+      downloadArtifact: (artifactId, requestSignal) =>
+        this.client.request<ArtifactsDownloadResult>(
+          "artifacts.download",
+          {
+            sessionKey: opts.sessionKey,
+            ...(opts.agentId ? { agentId: opts.agentId } : {}),
+            artifactId,
+          },
+          { signal: requestSignal },
+        ),
+    });
+  }
+
   async listSessions(opts?: SessionsListParams) {
     return await this.client.request<GatewaySessionList>("sessions.list", opts ?? {});
+  }
+
+  async resolveSession(opts: HandoffSessionResolveParams): Promise<SessionsResolveResult> {
+    return await this.client.request<SessionsResolveResult>("sessions.resolve", opts);
+  }
+
+  async describeSession(
+    opts: Parameters<TuiBackend["describeSession"]>[0],
+  ): Promise<TuiSessionDescription> {
+    const agentId = opts.agentId ?? parseAgentSessionKey(opts.sessionKey)?.agentId;
+    const signal = this.historyLifetime.signal;
+    for (;;) {
+      signal.throwIfAborted();
+      const connection = this.readyPromise;
+      const hello = this.hello;
+      const isCurrentConnection = () => connection === this.readyPromise && hello === this.hello;
+      try {
+        const [description, listing] = await Promise.all([
+          this.client.request<Pick<TuiSessionDescription, "session">>(
+            "sessions.describe",
+            { key: opts.sessionKey, ...(opts.agentId ? { agentId: opts.agentId } : {}) },
+            { signal },
+          ),
+          this.client.request<TuiSessionList>("sessions.list", { agentId, limit: 1 }, { signal }),
+        ]);
+        signal.throwIfAborted();
+        if (isCurrentConnection()) {
+          const session = description.session;
+          return {
+            session: session && isListedTuiSession(session) ? session : null,
+            defaults: listing.defaults,
+          };
+        }
+      } catch (error) {
+        if (signal.aborted || isCurrentConnection()) {
+          throw error;
+        }
+      }
+      await racePromiseWithAbortSignal(this.readyPromise, signal);
+    }
   }
 
   async listAgents() {
@@ -383,9 +525,19 @@ export class GatewayChatClient implements TuiBackend {
     return await this.client.request("status");
   }
 
-  async listModels(): Promise<GatewayModelChoice[]> {
-    const res = await this.client.request("models.list");
-    return Array.isArray(res?.models) ? res.models : [];
+  async listModels(opts?: { agentId?: string }): Promise<GatewayModelChoice[]> {
+    const published = this.hello?.features.capabilities?.includes(
+      GATEWAY_SERVER_CAPS.PUBLISHED_MODEL_CATALOG,
+    );
+    const res = await this.client.request("models.list", {
+      ...opts,
+      ...(published ? { includeDetails: true } : {}),
+    });
+    const models: GatewayModelChoice[] = Array.isArray(res?.models) ? res.models : [];
+    // Released Gateways reject includeDetails and collapse unknown availability to false.
+    return published
+      ? models
+      : models.map(({ available: _available, unavailableReason: _reason, ...model }) => model);
   }
 
   async listCommands(opts?: CommandsListParams): Promise<CommandEntry[]> {
@@ -395,6 +547,18 @@ export class GatewayChatClient implements TuiBackend {
 
   async listPluginApprovals() {
     return await this.client.request("plugin.approval.list", {});
+  }
+
+  async listQuestions(): Promise<QuestionListResult> {
+    return await this.client.request("question.list", {});
+  }
+
+  async getQuestion(id: string): Promise<QuestionGetResult> {
+    return await this.client.request("question.get", { id });
+  }
+
+  async resolveQuestion(params: QuestionResolveParams): Promise<QuestionResolveResult> {
+    return await this.client.request("question.resolve", params);
   }
 
   async resolvePluginApproval(id: string, decision: TuiApprovalDecision) {
@@ -439,6 +603,7 @@ export class GatewayChatClient implements TuiBackend {
   async acceptTaskSuggestion(taskId: string) {
     return await this.client.request<TaskSuggestionsAcceptResult>("taskSuggestions.accept", {
       taskId,
+      mode: "local",
     });
   }
 
@@ -455,21 +620,31 @@ export class GatewayChatClient implements TuiBackend {
  * deliberately ignores global config and Gateway env overrides, including
  * credentials, while still applying the normal remote URL safety policy.
  */
-function resolveBoundGatewayConnection(
+async function resolveBoundGatewayConnection(
   opts: GatewayConnectionOptions & { config: OpenClawConfig; url: string },
-): ResolvedGatewayConnection {
+): Promise<ResolvedGatewayConnection> {
   const url = buildGatewayConnectionDetails({
     config: opts.config,
     url: opts.url,
     ignoreEnvUrlOverride: true,
   }).url;
   const explicitAuth = resolveExplicitGatewayAuth({ token: opts.token, password: opts.password });
+  const edgeAuthConfig: EdgeAuthHeadersConfig | undefined = normalizeEdgeAuthHeadersConfig(
+    gatewayEdgeAuthValueForTarget({ config: opts.config, targetUrl: url }),
+  );
+  const edgeAuthHeaders = await resolveEdgeAuthHeaders({
+    config: opts.config,
+    value: edgeAuthConfig,
+    targetUrl: url,
+    env: process.env,
+  });
   return {
     url,
+    deviceAuthScope: gatewayOriginScope(url),
     token: explicitAuth.token,
     password: explicitAuth.password,
+    ...(edgeAuthHeaders ? { edgeAuthHeaders } : {}),
     ...(opts.tlsFingerprint ? { tlsFingerprint: opts.tlsFingerprint } : {}),
-    allowInsecureLocalOperatorUi: false,
   };
 }
 
@@ -480,102 +655,73 @@ async function resolveGatewayConnection(
   const env = process.env;
   const gatewayAuthMode = config.gateway?.auth?.mode;
   const isRemoteMode = config.gateway?.mode === "remote";
-  const preferConfiguredAuth = env[TUI_SETUP_AUTH_SOURCE_ENV] === TUI_SETUP_AUTH_SOURCE_CONFIG;
 
-  const urlOverride =
-    typeof opts.url === "string" && opts.url.trim().length > 0 ? opts.url.trim() : undefined;
+  const urlOverride = resolveGatewayUrlOverride({ gatewayUrl: opts.url, env });
   const explicitAuth = resolveExplicitGatewayAuth({ token: opts.token, password: opts.password });
-  ensureExplicitGatewayAuth({
-    urlOverride,
-    urlOverrideSource: "cli",
-    explicitAuth,
-    errorHint: "Fix: pass --token or --password when using --url.",
-  });
   const hasExplicitGatewayTarget = Boolean(
-    urlOverride ||
-    env.OPENCLAW_GATEWAY_URL?.trim() ||
-    env.OPENCLAW_GATEWAY_PORT?.trim() ||
-    isRemoteMode,
+    urlOverride.url || env.OPENCLAW_GATEWAY_PORT?.trim() || isRemoteMode,
   );
-  const activeLocalGatewayPort = hasExplicitGatewayTarget
-    ? undefined
-    : await readActiveGatewayLockPort();
-  const url = buildGatewayConnectionDetails({
-    config,
-    ...(urlOverride ? { url: urlOverride } : {}),
-    ...(activeLocalGatewayPort ? { localPortOverride: activeLocalGatewayPort } : {}),
-  }).url;
-  const allowInsecureLocalOperatorUi = false;
-
-  if (urlOverride) {
-    return {
-      url,
-      token: explicitAuth.token,
-      password: explicitAuth.password,
-      ...(opts.tlsFingerprint ? { tlsFingerprint: opts.tlsFingerprint } : {}),
-      allowInsecureLocalOperatorUi,
-    };
-  }
-
-  if (isRemoteMode) {
-    const resolved = await resolveGatewayInteractiveSurfaceAuth({
-      config,
-      env,
-      explicitAuth,
-      suppressEnvAuthFallback: preferConfiguredAuth,
-      surface: "remote",
-    });
-    if (resolved.failureReason) {
-      throwGatewayAuthResolutionError(resolved.failureReason);
+  const resumeMayMatchLocalTarget =
+    opts.allowConfiguredAuthForExactTarget === true &&
+    urlOverride.source === "cli" &&
+    !isRemoteMode &&
+    !env.OPENCLAW_GATEWAY_PORT?.trim();
+  const activeLocalGatewayPort =
+    !hasExplicitGatewayTarget || resumeMayMatchLocalTarget
+      ? await readActiveGatewayLockPort()
+      : undefined;
+  if (
+    !urlOverride.source &&
+    gatewayAuthMode !== "none" &&
+    gatewayAuthMode !== "trusted-proxy" &&
+    !isRemoteMode
+  ) {
+    try {
+      assertExplicitGatewayAuthModeWhenBothConfigured(config);
+    } catch (err) {
+      throwGatewayAuthResolutionError(formatErrorMessage(err));
     }
-    return {
-      url,
-      token: resolved.token,
-      password: resolved.password,
-      ...((opts.tlsFingerprint ?? config.gateway?.remote?.tlsFingerprint)
-        ? { tlsFingerprint: opts.tlsFingerprint ?? config.gateway?.remote?.tlsFingerprint }
-        : {}),
-      allowInsecureLocalOperatorUi: false,
-    };
   }
-
-  if (gatewayAuthMode === "none" || gatewayAuthMode === "trusted-proxy") {
-    const resolved = await resolveGatewayInteractiveSurfaceAuth({
-      config,
-      env,
-      explicitAuth,
-      surface: "local",
-    });
-    return {
-      url,
-      token: resolved.token,
-      password: resolved.password,
-      ...(opts.tlsFingerprint ? { tlsFingerprint: opts.tlsFingerprint } : {}),
-      allowInsecureLocalOperatorUi,
-    };
-  }
-
-  try {
-    assertExplicitGatewayAuthModeWhenBothConfigured(config);
-  } catch (err) {
-    throwGatewayAuthResolutionError(formatErrorMessage(err));
-  }
-
-  const resolved = await resolveGatewayInteractiveSurfaceAuth({
+  const bootstrap = await resolveGatewayClientBootstrap({
     config,
-    env,
+    gatewayUrl: urlOverride.source === "cli" ? urlOverride.url : undefined,
     explicitAuth,
-    suppressEnvAuthFallback: preferConfiguredAuth,
-    surface: "local",
+    env,
+    authPolicy: "interactive",
+    allowConfiguredAuthForExactTarget: opts.allowConfiguredAuthForExactTarget,
+    suppressEnvAuthFallback: opts.suppressEnvAuthFallback,
+    ...(activeLocalGatewayPort ? { localPortOverride: activeLocalGatewayPort } : {}),
+    explicitTlsFingerprint: opts.tlsFingerprint,
+    allowStoredOriginAuth: hasStoredOriginDeviceAuth,
+    overrideAuthErrorHint:
+      "Fix: pass --token or --password once to request pairing, approve it in that gateway's Control UI (Settings -> Devices), then retry with the same credential so OpenClaw can store the device token.",
+    buildConnectionDetails: buildGatewayConnectionDetails,
   });
-  if (resolved.failureReason) {
-    throwGatewayAuthResolutionError(resolved.failureReason);
+  const hasStoredOriginAuth = Boolean(
+    bootstrap.deviceAuthScope && (await hasStoredOriginDeviceAuth(bootstrap.deviceAuthScope)),
+  );
+  const missingSharedAuth =
+    bootstrap.authFailureReason === "Missing gateway auth credentials." ||
+    bootstrap.authFailureReason === "Missing gateway auth token." ||
+    bootstrap.authFailureReason === "Missing gateway auth password.";
+  if (bootstrap.authFailureReason && (!missingSharedAuth || !hasStoredOriginAuth)) {
+    throwGatewayAuthResolutionError(bootstrap.authFailureReason);
   }
+  const edgeAuthConfig: EdgeAuthHeadersConfig | undefined = normalizeEdgeAuthHeadersConfig(
+    gatewayEdgeAuthValueForTarget({ config, targetUrl: bootstrap.url }),
+  );
+  const edgeAuthHeaders = await resolveEdgeAuthHeaders({
+    config,
+    value: edgeAuthConfig,
+    targetUrl: bootstrap.url,
+    env,
+  });
   return {
-    url,
-    token: resolved.token,
-    password: resolved.password,
-    ...(opts.tlsFingerprint ? { tlsFingerprint: opts.tlsFingerprint } : {}),
-    allowInsecureLocalOperatorUi,
+    url: bootstrap.url,
+    deviceAuthScope: bootstrap.deviceAuthScope,
+    token: bootstrap.auth.token,
+    password: bootstrap.auth.password,
+    ...(edgeAuthHeaders ? { edgeAuthHeaders } : {}),
+    ...(bootstrap.tlsFingerprint ? { tlsFingerprint: bootstrap.tlsFingerprint } : {}),
   };
 }

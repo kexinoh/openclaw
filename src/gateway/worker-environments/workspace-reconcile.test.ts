@@ -9,7 +9,11 @@ import type {
   WorkerWorkspaceManifest,
   WorkerWorkspaceManifestEntry,
 } from "./workspace-manifest.js";
-import { serializeWorkerWorkspaceManifest } from "./workspace-manifest.js";
+import {
+  MAX_RECONCILIATION_ENTRIES,
+  parseWorkerWorkspaceReconciliationPlan,
+  serializeWorkerWorkspaceManifest,
+} from "./workspace-manifest.js";
 import {
   applyStagedWorkerWorkspace,
   type WorkerWorkspaceReconciliationJournal,
@@ -110,7 +114,7 @@ async function applyWorkspace(params: {
     ...params,
     baseManifestRef: `sha256:${"a".repeat(64)}`,
     currentManifestRef: `sha256:${"b".repeat(64)}`,
-    publishAcceptedManifest: params.publishAcceptedManifest,
+    acceptance: { kind: "reconcile", publish: params.publishAcceptedManifest },
     journal: {
       load: () => pending,
       begin: (journal) => {
@@ -190,7 +194,7 @@ describe("worker workspace reconciliation", () => {
     }
   });
 
-  it("applies the complete candidate before publishing its recovery ref", async () => {
+  it("applies the candidate before publishing its recovery ref", async () => {
     const local = await temporaryDirectory("workspace-staged-ref-local");
     const payload = await temporaryDirectory("workspace-staged-ref-payload");
     const complete = await temporaryDirectory("workspace-staged-ref-complete");
@@ -302,6 +306,28 @@ describe("worker workspace reconciliation", () => {
         })
       ).code,
     ).not.toBe(0);
+  });
+
+  it("rejects a persisted journal above the combined inventory record budget", () => {
+    expect(() =>
+      parseWorkerWorkspaceReconciliationPlan(
+        JSON.stringify({
+          version: 1,
+          temporaryNonce: "a".repeat(32),
+          baseManifestRef: `sha256:${"a".repeat(64)}`,
+          currentManifestRef: `sha256:${"b".repeat(64)}`,
+          baseEntries: [],
+          appliedEntries: [],
+          baseDirectories: Array.from(
+            { length: MAX_RECONCILIATION_ENTRIES + 1 },
+            (_, index) => `directory-${index}`,
+          ),
+          appliedDirectories: [],
+          baseTree: "b".repeat(40),
+          basePackSha256: "c".repeat(64),
+        }),
+      ),
+    ).toThrow("unsupported shape");
   });
 
   it("preserves the published result when its fence-row update fails", async () => {
@@ -423,10 +449,13 @@ describe("worker workspace reconciliation", () => {
     });
 
     expect(cleanupRef).toBe(cleanupWorkerWorkspaceResultRef(stagedResultRef));
-    await deleteWorkerWorkspaceResultCleanupRefs({
+    const retainedRefs = new Set<string>();
+    const cleanup = deleteWorkerWorkspaceResultCleanupRefs({
       root: local,
-      retainedRefs: new Set([cleanupRef]),
+      retainedRefs: () => retainedRefs,
     });
+    retainedRefs.add(cleanupRef);
+    await cleanup;
     await expect(
       hasWorkerWorkspaceResultRef({ root: local, stagedResultRef: cleanupRef }),
     ).resolves.toBe(true);
@@ -894,7 +923,7 @@ describe("worker workspace reconciliation", () => {
     const staged = await temporaryDirectory("workspace-directory-delete-derived-staged");
     await fs.mkdir(path.join(local, "removed", "nested"), { recursive: true });
     await fs.writeFile(path.join(local, "removed", "nested", "base.txt"), "base");
-    const base = await manifestFor(local);
+    const base = { ...(await manifestFor(local)), baseCommit: "a".repeat(40) };
     await fs.mkdir(path.join(local, "removed", "nested", "__pycache__"));
     await fs.writeFile(
       path.join(local, "removed", "nested", "__pycache__", "cache.pyc"),
@@ -905,7 +934,7 @@ describe("worker workspace reconciliation", () => {
       root: local,
       stagingRoot: staged,
       base,
-      current: await manifestFor(staged),
+      current: { ...(await manifestFor(staged)), baseCommit: "a".repeat(40) },
     });
 
     expect(applied.conflictPaths).toEqual([]);

@@ -1,4 +1,3 @@
-// Slack plugin module implements doctor contract behavior.
 import type {
   ChannelDoctorConfigMutation,
   ChannelDoctorLegacyConfigRule,
@@ -10,7 +9,8 @@ import {
   defineKeyMoveMigration,
   hasLegacyAccountStreamingAliases,
   normalizeChannelConfigEntries,
-} from "openclaw/plugin-sdk/runtime-doctor";
+  stripRetiredChannelKeys,
+} from "openclaw/plugin-sdk/runtime-doctor-migrations";
 import { resolveSlackNativeStreaming, resolveSlackStreamingMode } from "./streaming-compat.js";
 
 const streamingAliasMigration = defineChannelAliasMigration({
@@ -62,6 +62,10 @@ function hasInteractiveRepliesCapability(value: unknown): boolean {
   );
 }
 
+function hasEnterpriseOrgInstall(value: unknown): boolean {
+  return Object.hasOwn(asObjectRecord(value) ?? {}, "enterpriseOrgInstall");
+}
+
 function removeInteractiveRepliesCapability(params: {
   entry: Record<string, unknown>;
   pathPrefix: string;
@@ -111,6 +115,17 @@ function removeInteractiveRepliesCapability(params: {
 
 export const legacyConfigRules: ChannelDoctorLegacyConfigRule[] = [
   ...streamingAliasMigration.legacyConfigRules,
+  {
+    path: ["channels", "slack", "enterpriseOrgInstall"],
+    message:
+      'channels.slack.enterpriseOrgInstall is retired; Slack now detects org-wide installations automatically. Run "openclaw doctor --fix".',
+  },
+  {
+    path: ["channels", "slack", "accounts"],
+    message:
+      'channels.slack.accounts.<id>.enterpriseOrgInstall is retired; Slack now detects org-wide installations automatically. Run "openclaw doctor --fix".',
+    match: (value) => hasLegacyAccountStreamingAliases(value, hasEnterpriseOrgInstall),
+  },
   {
     path: ["channels", "slack"],
     message:
@@ -186,7 +201,20 @@ export function normalizeCompatibilityConfig({
   cfg: OpenClawConfig;
 }): ChannelDoctorConfigMutation {
   const changes: string[] = [];
-  const aliases = streamingAliasMigration.normalizeChannelConfig({ cfg, changes });
+  const retired = stripRetiredChannelKeys({
+    cfg,
+    channelId: "slack",
+    keys: new Set(["enterpriseOrgInstall"]),
+    scope: "root-and-accounts",
+    onRemove: ({ key, pathPrefix }) =>
+      changes.push(
+        `Removed retired ${pathPrefix}.${key}; Slack detects org-wide installations automatically.`,
+      ),
+  });
+  const aliases = streamingAliasMigration.normalizeChannelConfig({
+    cfg: retired.config,
+    changes,
+  });
   return normalizeChannelConfigEntries({
     cfg: aliases.config,
     channelId: "slack",

@@ -20,7 +20,7 @@ export function findMatrixQaUnexpectedWorkingEvents(params: {
     if (event.eventId === params.previewEventId || event.eventId === params.finalEventId) {
       return false;
     }
-    return event.relatesTo?.eventId !== params.previewEventId;
+    return event.replacesEventId !== params.previewEventId;
   });
 }
 
@@ -35,6 +35,13 @@ export function assertMatrixQaToolProgressMentionsInert(event: MatrixQaObservedE
     throw new Error(
       `Matrix tool-progress preview linked Matrix mentions: ${event.formattedBody ?? "<none>"}`,
     );
+  }
+  const mentionTextPattern = /@room|@alice:matrix-qa\.test|!room:matrix-qa\.test/i;
+  if (
+    !mentionTextPattern.test(event.body ?? "") &&
+    !mentionTextPattern.test(event.formattedBody ?? "")
+  ) {
+    return;
   }
   if (
     !/<code>[^<]*(?:@room|@alice:matrix-qa\.test|!room:matrix-qa\.test)/i.test(
@@ -66,6 +73,7 @@ function describeMatrixQaToolProgressCandidate(event: MatrixQaObservedEvent) {
     : "<none>";
   return [
     `${event.eventId} kind=${event.kind}`,
+    `replaces=${event.replacesEventId ?? "<none>"}`,
     `relation=${relation}`,
     `body=${JSON.stringify(truncateMatrixQaToolProgressBody(event.body))}`,
   ].join(" ");
@@ -93,7 +101,7 @@ export function buildMatrixQaToolProgressTimeoutMessage(params: {
       }
       return (
         event.eventId === params.previewEventId ||
-        event.relatesTo?.eventId === params.previewEventId ||
+        event.replacesEventId === params.previewEventId ||
         event.body !== undefined
       );
     })
@@ -152,7 +160,7 @@ export function buildMatrixQaToolProgressFinalTimeoutMessage(params: {
       ) {
         return false;
       }
-      return event.relatesTo?.eventId === params.previewEventId;
+      return event.replacesEventId === params.previewEventId;
     })
     .slice(-8);
   const candidateDetails =

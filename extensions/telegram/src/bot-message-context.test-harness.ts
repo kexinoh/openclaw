@@ -32,7 +32,7 @@ type BuildTelegramMessageContextForTestParams = {
   accountId?: string;
   dmPolicy?: BuildTelegramMessageContextParams["dmPolicy"];
   historyLimit?: number;
-  groupHistories?: Map<string, import("openclaw/plugin-sdk/reply-history").HistoryEntry[]>;
+  dmHistoryLimit?: number;
   ackReactionScope?: BuildTelegramMessageContextParams["ackReactionScope"];
   botApi?: Record<string, unknown>;
   sendChatActionHandler?: BuildTelegramMessageContextParams["sendChatActionHandler"];
@@ -148,7 +148,7 @@ export async function buildTelegramMessageContextForTest(
     sessionRuntime,
     account: { accountId: params.accountId ?? "default" } as never,
     historyLimit: params.historyLimit ?? 0,
-    groupHistories: params.groupHistories ?? new Map(),
+    dmHistoryLimit: params.dmHistoryLimit ?? 10,
     dmPolicy: params.dmPolicy ?? "open",
     allowFrom: ["*"],
     groupAllowFrom: [],

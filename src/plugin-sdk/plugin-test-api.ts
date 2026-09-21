@@ -23,6 +23,7 @@ export function createTestPluginApi(api: TestPluginApiInput = {}): OpenClawPlugi
     registerHook() {},
     registerHttpRoute() {},
     registerHostedMediaResolver() {},
+    registerWidgetPresenter() {},
     registerMcpServerConnectionResolver() {},
     registerChannel() {},
     registerGatewayMethod() {},
@@ -59,6 +60,7 @@ export function createTestPluginApi(api: TestPluginApiInput = {}): OpenClawPlugi
     registerCommand() {},
     registerContextEngine() {},
     registerCompactionProvider() {},
+    registerDecisionProvider() {},
     registerAgentHarness() {},
     registerCodexAppServerExtensionFactory() {},
     registerAgentToolResultMiddleware() {},
@@ -72,6 +74,7 @@ export function createTestPluginApi(api: TestPluginApiInput = {}): OpenClawPlugi
     registerTrustedToolPolicy() {},
     registerToolMetadata() {},
     registerControlUiDescriptor() {},
+    registerBoardWidgetContentKind() {},
     registerRuntimeLifecycle() {},
     registerAgentEventSubscription() {},
     emitAgentEvent: () => ({ emitted: false as const, reason: "test api" }),
@@ -87,7 +90,6 @@ export function createTestPluginApi(api: TestPluginApiInput = {}): OpenClawPlugi
     registerMemoryPromptSupplement() {},
     registerMemoryPromptPreparation() {},
     registerMemoryCorpusSupplement() {},
-    registerMemoryEmbeddingProvider() {},
     resolvePath(input: string) {
       return input;
     },

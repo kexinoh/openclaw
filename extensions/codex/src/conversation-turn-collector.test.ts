@@ -1,4 +1,3 @@
-// Codex tests cover conversation turn collector plugin behavior.
 import { MAX_TIMER_TIMEOUT_MS } from "openclaw/plugin-sdk/number-runtime";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -33,23 +32,51 @@ describe("codex conversation turn collector", () => {
     await expect(completion).resolves.toEqual({ replyText: "hello world" });
   });
 
-  it("buffers pre-start notifications and replays only the selected turn", async () => {
+  it.each([
+    {
+      scenario: "commentary after an answer",
+      metadata: { phase: "commentary", delivery: null },
+      replyText: "real answer",
+    },
+    {
+      scenario: "async-only",
+      metadata: { phase: "final_answer", delivery: "async" },
+      replyText: "",
+    },
+    {
+      scenario: "async after an answer",
+      metadata: { phase: "final_answer", delivery: "async" },
+      replyText: "real answer",
+    },
+  ])("does not promote progress to a final answer ($scenario)", async ({ metadata, replyText }) => {
     const collector = createCodexConversationTurnCollector("thread-1");
-
-    collector.handleNotification({
-      method: "turn/completed",
-      params: {
-        threadId: "thread-1",
-        turn: {
-          id: "turn-stale",
-          status: "completed",
-          items: [{ type: "agentMessage", id: "wrong", text: "stale answer" }],
+    collector.setTurnId("turn-1");
+    if (replyText) {
+      collector.handleNotification({
+        method: "item/completed",
+        params: {
+          threadId: "thread-1",
+          turnId: "turn-1",
+          item: { type: "agentMessage", id: "answer", text: replyText, phase: "final_answer" },
         },
-      },
-    });
+      });
+    }
     collector.handleNotification({
       method: "item/agentMessage/delta",
-      params: { threadId: "thread-1", turnId: "turn-1", itemId: "right", delta: "fresh " },
+      params: { threadId: "thread-1", turnId: "turn-1", itemId: "progress", delta: "progress" },
+    });
+    collector.handleNotification({
+      method: "item/completed",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        item: {
+          type: "agentMessage",
+          id: "progress",
+          text: "completed progress",
+          ...metadata,
+        },
+      },
     });
     collector.handleNotification({
       method: "turn/completed",
@@ -58,15 +85,78 @@ describe("codex conversation turn collector", () => {
         turn: {
           id: "turn-1",
           status: "completed",
-          items: [{ type: "agentMessage", id: "right", text: "fresh answer" }],
+          items: [
+            { type: "agentMessage", id: "progress", text: "completed progress", ...metadata },
+          ],
         },
       },
     });
 
-    collector.setTurnId("turn-1");
+    await expect(collector.wait({ timeoutMs: 100 })).resolves.toEqual({
+      replyText,
+    });
+  });
 
-    await expect(collector.wait({ timeoutMs: 1_000 })).resolves.toEqual({
-      replyText: "fresh answer",
+  it("returns the last completed final answer when the terminal summary is empty", async () => {
+    const collector = createCodexConversationTurnCollector("thread-1");
+    collector.setTurnId("turn-1");
+    const completedAnswers: Array<{ id: string; text: string }> = [
+      { id: "first", text: "first answer" },
+      { id: "second", text: "second answer" },
+    ];
+    for (const { id, text } of completedAnswers) {
+      collector.handleNotification({
+        method: "item/completed",
+        params: {
+          threadId: "thread-1",
+          turnId: "turn-1",
+          item: { type: "agentMessage", id, text, phase: "final_answer" },
+        },
+      });
+    }
+    collector.handleNotification({
+      method: "turn/completed",
+      params: { threadId: "thread-1", turn: { id: "turn-1", status: "completed", items: [] } },
+    });
+
+    await expect(collector.wait({ timeoutMs: 100 })).resolves.toEqual({
+      replyText: "second answer",
+    });
+  });
+
+  it("lets the terminal final answer supersede later streamed completions", async () => {
+    const collector = createCodexConversationTurnCollector("thread-1");
+    collector.setTurnId("turn-1");
+    collector.handleNotification({
+      method: "item/completed",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        item: { type: "agentMessage", id: "answer", text: "earlier answer" },
+      },
+    });
+    collector.handleNotification({
+      method: "item/completed",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        item: { type: "agentMessage", id: "later", text: "later answer" },
+      },
+    });
+    collector.handleNotification({
+      method: "turn/completed",
+      params: {
+        threadId: "thread-1",
+        turn: {
+          id: "turn-1",
+          status: "completed",
+          items: [{ type: "agentMessage", id: "answer", text: "terminal answer" }],
+        },
+      },
+    });
+
+    await expect(collector.wait({ timeoutMs: 100 })).resolves.toEqual({
+      replyText: "terminal answer",
     });
   });
 
@@ -233,58 +323,30 @@ describe("codex conversation turn collector", () => {
     await expect(completion).rejects.toThrow("codex app-server turn interrupted");
   });
 
-  it("confirms a terminal notification that arrives after the bound turn times out", async () => {
-    vi.useFakeTimers();
+  it("rejects a non-terminal status instead of returning streamed partial text", async () => {
     const collector = createCodexConversationTurnCollector("thread-1");
     collector.setTurnId("turn-1");
-    const completion = collector.wait({ timeoutMs: 100 });
-    const timedOut = expect(completion).rejects.toBeInstanceOf(CodexConversationTurnTimeoutError);
+    const completion = collector.wait({ timeoutMs: 1_000 });
 
-    await vi.advanceTimersByTimeAsync(100);
-    await timedOut;
-
-    const terminal = collector.waitForTerminal({ timeoutMs: 5_000 });
+    collector.handleNotification({
+      method: "item/agentMessage/delta",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        itemId: "item-1",
+        delta: "unfinished answer",
+      },
+    });
     collector.handleNotification({
       method: "turn/completed",
       params: {
         threadId: "thread-1",
-        turn: { id: "turn-1", status: "interrupted", error: null, items: [] },
+        turn: { id: "turn-1", status: "inProgress", error: null, items: [] },
       },
     });
 
-    await expect(terminal).resolves.toBeUndefined();
-    expect(vi.getTimerCount()).toBe(0);
-  });
-
-  it("rejects when an acknowledged interrupted turn never reaches terminal state", async () => {
-    vi.useFakeTimers();
-    const collector = createCodexConversationTurnCollector("thread-1");
-    collector.setTurnId("turn-1");
-    const terminal = collector.waitForTerminal({ timeoutMs: 5_000 });
-    const assertion = expect(terminal).rejects.toThrow(
-      "codex app-server interrupted turn did not complete",
-    );
-
-    await vi.advanceTimersByTimeAsync(5_000);
-
-    await assertion;
-    expect(vi.getTimerCount()).toBe(0);
-  });
-
-  it("rejects an interrupted turn buffered before its turn id is known", async () => {
-    const collector = createCodexConversationTurnCollector("thread-1");
-
-    collector.handleNotification({
-      method: "turn/completed",
-      params: {
-        threadId: "thread-1",
-        turn: { id: "turn-1", status: "interrupted", error: null, items: [] },
-      },
-    });
-    collector.setTurnId("turn-1");
-
-    await expect(collector.wait({ timeoutMs: 1_000 })).rejects.toThrow(
-      "codex app-server turn interrupted",
+    await expect(completion).rejects.toThrow(
+      "codex app-server turn completed without a valid terminal status",
     );
   });
 

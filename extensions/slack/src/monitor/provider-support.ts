@@ -1,10 +1,15 @@
 // Slack provider module implements model/runtime integration.
 import { toErrorObject } from "openclaw/plugin-sdk/error-runtime";
-import { asOptionalRecord as asRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
+import { channelBlockedPatch, channelReadyPatch } from "openclaw/plugin-sdk/gateway-runtime";
+import {
+  asOptionalRecord as asRecord,
+  normalizeOptionalString,
+} from "openclaw/plugin-sdk/string-coerce-runtime";
 import type { SlackChannelResolution } from "../resolve-channels.js";
 import type { SlackUserResolution } from "../resolve-users.js";
 import type { SlackIdentityHealth } from "./enterprise-install.js";
 import { formatUnknownError, waitForSlackSocketDisconnect } from "./reconnect-policy.js";
+import { installSlackSocketModeEnvelopeGuard } from "./socket-mode-envelope.js";
 
 type SlackAppConstructor = typeof import("@slack/bolt").App;
 type SlackHttpReceiverConstructor = typeof import("@slack/bolt").HTTPReceiver;
@@ -37,13 +42,18 @@ type SlackSocketShutdownClient = {
 };
 type Constructor = abstract new (...args: never[]) => unknown;
 type SlackSelfFilterArgs = {
+  body?: unknown;
   context?: {
     botId?: string;
     botUserId?: string;
+    teamId?: string;
+    enterpriseId?: string;
+    isEnterpriseInstall?: boolean;
   };
   event?: unknown;
   message?: unknown;
 };
+type SlackContextIdentity = NonNullable<SlackSelfFilterArgs["context"]> & { apiAppId?: string };
 
 function isConstructorFunction<
   // oxlint-disable-next-line typescript/no-unnecessary-type-parameters -- Constructor guard preserves the requested concrete Slack constructor type.
@@ -90,7 +100,8 @@ function installSlackNativeReconnectFailureObserver(receiver: unknown) {
         `Before trying to reconnect, this client will wait for ${delayMs} milliseconds`,
       );
       return new Promise((resolve, reject) => {
-        setTimeout(() => {
+        const reconnectTimer = setTimeout(() => {
+          Reflect.set(this, "reconnectionTimer", undefined);
           if (Reflect.get(this, "shuttingDown")) {
             logger?.debug?.("Client shutting down, will not attempt reconnect.");
             resolve(undefined);
@@ -107,6 +118,9 @@ function installSlackNativeReconnectFailureObserver(receiver: unknown) {
             reject(toErrorObject(error, "Non-Error rejection"));
           });
         }, delayMs);
+        // SocketModeClient.disconnect() clears this field. Keep the patched
+        // scheduler on the SDK's lifecycle so a stopped app cannot reconnect.
+        Reflect.set(this, "reconnectionTimer", reconnectTimer);
       });
     },
   );
@@ -186,16 +200,31 @@ export function resolveSlackBoltInterop(params: {
 
 export function publishSlackConnectedStatus(
   setStatus?: (next: Record<string, unknown>) => void,
-  identityHealth: SlackIdentityHealth = { healthState: "healthy", lastError: null },
+  identityHealth: SlackIdentityHealth = { lifecycle: "ready", lastError: null },
 ) {
   if (!setStatus) {
     return;
   }
-  setStatus({
-    connected: true,
-    lastConnectedAt: Date.now(),
-    ...identityHealth,
-  });
+  const lastConnectedAt = Date.now();
+  setStatus(
+    identityHealth.lifecycle === "blocked"
+      ? channelBlockedPatch(identityHealth.lastError, { connected: true, lastConnectedAt })
+      : channelReadyPatch({ lastConnectedAt }),
+  );
+}
+
+export function publishSlackBlockedStatus(
+  setStatus: ((next: Record<string, unknown>) => void) | undefined,
+  error: unknown,
+) {
+  if (!setStatus) {
+    return;
+  }
+  setStatus(
+    channelBlockedPatch(formatUnknownError(error), {
+      connected: false,
+    }),
+  );
 }
 
 export function publishSlackDisconnectedStatus(
@@ -209,7 +238,7 @@ export function publishSlackDisconnectedStatus(
   const message = error ? formatUnknownError(error) : undefined;
   setStatus({
     connected: false,
-    healthState: "disconnected",
+    lifecycle: "recovering",
     lastDisconnect: message ? { at, error: message } : { at },
     lastError: message ?? null,
   });
@@ -312,6 +341,7 @@ export function createSlackBoltApp(params: {
   clientOptions: Record<string, unknown>;
   dispatcher?: SlackSocketModeReceiverOptions["dispatcher"];
   wrapReceiver?: (receiver: SlackReceiver) => SlackReceiver;
+  onContextIdentity?: (identity: SlackContextIdentity) => void | Promise<void>;
 }) {
   const socketModeLogger = createSlackSocketModeLogger();
   const socketModeReceiverOptions: SlackSocketModeReceiverOptions = {
@@ -332,8 +362,23 @@ export function createSlackBoltApp(params: {
     | SlackReceiver
     | undefined;
   if (params.slackMode === "socket") {
-    receiver = new params.interop.SocketModeReceiver(socketModeReceiverOptions);
-    installSlackNativeReconnectFailureObserver(receiver);
+    const socketReceiver = new params.interop.SocketModeReceiver(socketModeReceiverOptions);
+    const socketClient = socketReceiver.client;
+    // Slack's declarations hide the private acknowledgement sender's signature.
+    // Validate and bind the SDK method before constructing the receive guard.
+    const send: unknown = Reflect.get(socketClient, "send");
+    if (typeof send !== "function") {
+      throw new Error("Slack Socket Mode client requires the SDK acknowledgement sender.");
+    }
+    installSlackSocketModeEnvelopeGuard(
+      socketClient,
+      async (envelopeId) => {
+        await send.call(socketClient, envelopeId);
+      },
+      socketModeLogger,
+    );
+    installSlackNativeReconnectFailureObserver(socketReceiver);
+    receiver = socketReceiver;
   } else if (params.slackMode === "http") {
     receiver = new params.interop.HTTPReceiver({
       signingSecret: params.signingSecret ?? "",
@@ -355,6 +400,10 @@ export function createSlackBoltApp(params: {
     ...(appReceiver ? { receiver: appReceiver } : {}),
   });
   app.use(async (args) => {
+    await params.onContextIdentity?.({
+      ...args.context,
+      apiAppId: normalizeOptionalString(asRecord(args.body)?.api_app_id),
+    });
     if (shouldSkipOpenClawSlackSelfEvent(args)) {
       return;
     }
@@ -388,7 +437,7 @@ function createSlackSocketDisconnectWaiter(app: unknown, abortSignal?: AbortSign
 export async function startSlackSocketAndWaitForDisconnect(params: {
   app: { start: () => unknown };
   abortSignal?: AbortSignal;
-  onStarted?: () => void;
+  onStarted?: () => void | Promise<void>;
 }) {
   const disconnectWaiter = createSlackSocketDisconnectWaiter(params.app, params.abortSignal);
   try {
@@ -397,7 +446,7 @@ export async function startSlackSocketAndWaitForDisconnect(params: {
       disconnectWaiter.cancel();
       return null;
     }
-    params.onStarted?.();
+    await params.onStarted?.();
     const disconnect = await disconnectWaiter.promise;
     disconnectWaiter.complete();
     return disconnect;

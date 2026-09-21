@@ -1,21 +1,8 @@
 import { sleep } from "../utils/sleep.js";
+import { hasErrnoCode } from "./errno.js";
 
 const BACKUP_TAR_MAX_ATTEMPTS = 3;
 const BACKUP_TAR_BACKOFF_MS = [10_000, 20_000];
-
-function isTarEofRaceError(err: unknown): boolean {
-  if (!err || typeof err !== "object") {
-    return false;
-  }
-  const code = (err as NodeJS.ErrnoException).code;
-  if (code === "EOF") {
-    return true;
-  }
-  // Match only node-tar's grow/shrink race errors and truncated archive code.
-  // Broad EOF matching also catches unrelated TLS failures and causes pointless retries.
-  const message = (err as Error).message ?? "";
-  return /(did not encounter expected|encountered unexpected) EOF|TAR_BAD_ARCHIVE/i.test(message);
-}
 
 type BackupTarRetryLogger = (message: string) => void;
 
@@ -31,13 +18,15 @@ export async function writeTarArchiveWithRetry<T>(params: {
 }): Promise<T> {
   const sleepFn = params.sleepMs ?? sleep;
   let lastErr: unknown;
+  let attempts = 0;
   for (let attempt = 1; attempt <= BACKUP_TAR_MAX_ATTEMPTS; attempt += 1) {
+    attempts = attempt;
     const attemptTempArchivePath = resolveBackupTarAttemptTempPath(params.tempArchivePath, attempt);
     try {
       return await params.runTar(attemptTempArchivePath);
     } catch (err) {
       lastErr = err;
-      if (!isTarEofRaceError(err) || attempt === BACKUP_TAR_MAX_ATTEMPTS) {
+      if (!hasErrnoCode(err, "EOF") || attempt === BACKUP_TAR_MAX_ATTEMPTS) {
         break;
       }
       // The writer owns checked cleanup inside the private staging directory.
@@ -54,8 +43,9 @@ export async function writeTarArchiveWithRetry<T>(params: {
   }
   const final = lastErr instanceof Error ? lastErr : new Error(String(lastErr));
   const offendingPath = (lastErr as NodeJS.ErrnoException | undefined)?.path;
+  const attemptSuffix = `after ${attempts} attempt${attempts === 1 ? "" : "s"}`;
   const suffix = offendingPath
-    ? ` (last offending path: ${offendingPath}, after ${BACKUP_TAR_MAX_ATTEMPTS} attempts)`
-    : ` (after ${BACKUP_TAR_MAX_ATTEMPTS} attempts)`;
+    ? ` (last offending path: ${offendingPath}, ${attemptSuffix})`
+    : ` (${attemptSuffix})`;
   throw new Error(`Backup archive write failed: ${final.message}${suffix}`, { cause: final });
 }

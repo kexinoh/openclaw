@@ -2,6 +2,10 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import {
+  acquireQaCredentialLease,
+  startQaCredentialLeaseHeartbeat,
+} from "../../../../extensions/qa-lab/src/live-transports/shared/credential-lease.runtime.js";
 import { formatErrorMessage } from "../../../../src/infra/errors.js";
 import {
   createOpenClawTestInstance,
@@ -30,13 +34,45 @@ type TelegramProductStartupInstance = Pick<
 >;
 
 type TelegramRuntimeDependencies = {
+  acquireCredential: (env: NodeJS.ProcessEnv) => Promise<TelegramCredentialLease>;
   createInstance: (
     options: Parameters<typeof createOpenClawTestInstance>[0],
   ) => Promise<TelegramProductStartupInstance>;
+  startCredentialHeartbeat: (lease: TelegramCredentialLease) => TelegramCredentialLeaseHeartbeat;
+};
+
+type TelegramCredentialLease = {
+  heartbeat(): Promise<void>;
+  heartbeatIntervalMs: number;
+  kind: string;
+  payload: { sutToken: string };
+  release(): Promise<void>;
+  source: "convex" | "env";
+};
+
+type TelegramCredentialLeaseHeartbeat = {
+  stop(): Promise<void>;
+  throwIfFailed(): void;
 };
 
 const defaultDependencies: TelegramRuntimeDependencies = {
+  acquireCredential: async (env) => {
+    const directCredential = resolveLeasedToken(env);
+    return await acquireQaCredentialLease({
+      env,
+      kind: "telegram",
+      source: directCredential ? "env" : env.OPENCLAW_QA_CREDENTIAL_SOURCE,
+      resolveEnvPayload: () => {
+        if (!directCredential) {
+          throw new Error(`none of ${TOKEN_ENV_KEYS.join(", ")} is set`);
+        }
+        return { sutToken: directCredential.token };
+      },
+      parsePayload: parseTelegramCredentialPayload,
+    });
+  },
   createInstance: createOpenClawTestInstance,
+  startCredentialHeartbeat: (lease) => startQaCredentialLeaseHeartbeat(lease),
 };
 
 const wait = (durationMs: number) =>
@@ -116,6 +152,17 @@ function resolveLeasedToken(env: NodeJS.ProcessEnv = process.env) {
   return undefined;
 }
 
+function parseTelegramCredentialPayload(payload: unknown) {
+  if (!payload || typeof payload !== "object") {
+    throw new Error("Telegram credential payload must be an object");
+  }
+  const sutToken = (payload as { sutToken?: unknown }).sutToken;
+  if (typeof sutToken !== "string" || !sutToken.trim()) {
+    throw new Error("Telegram credential payload requires sutToken");
+  }
+  return { sutToken: sutToken.trim() };
+}
+
 function createWriter(options: TelegramRuntimeOptions) {
   return createQaScriptEvidenceWriter({
     artifactBase: options.artifactBase,
@@ -146,8 +193,9 @@ export async function runTelegramBotTokenRuntime(
   await fs.mkdir(options.artifactBase, { recursive: true });
   const writer = createWriter(options);
   const startedAt = Date.now();
-  const credential = resolveLeasedToken(env);
-  if (!credential) {
+  const directCredential = resolveLeasedToken(env);
+  const configuredSource = env.OPENCLAW_QA_CREDENTIAL_SOURCE?.trim().toLowerCase();
+  if (!directCredential && configuredSource !== "convex") {
     writer.appendLog(
       `telegram-startup-getme: blocked; none of ${TOKEN_ENV_KEYS.join(", ")} is set\n`,
     );
@@ -158,9 +206,15 @@ export async function runTelegramBotTokenRuntime(
     });
   }
 
-  writer.appendLog(`telegram-startup-getme: using leased credential from ${credential.key}\n`);
+  let credentialLease: TelegramCredentialLease | undefined;
+  let credentialHeartbeat: TelegramCredentialLeaseHeartbeat | undefined;
   let instance: TelegramProductStartupInstance | undefined;
   try {
+    credentialLease = await dependencies.acquireCredential(env);
+    credentialHeartbeat = dependencies.startCredentialHeartbeat(credentialLease);
+    const credentialLabel = directCredential?.key ?? `${credentialLease.source} credential lease`;
+    const token = credentialLease.payload.sutToken;
+    writer.appendLog(`telegram-startup-getme: using credential from ${credentialLabel}\n`);
     instance = await dependencies.createInstance({
       name: "qa-telegram-startup-getme",
       config: {
@@ -174,36 +228,52 @@ export async function runTelegramBotTokenRuntime(
             accounts: {
               [LIVE_ACCOUNT_ID]: {
                 enabled: true,
-                botToken: credential.token,
+                botToken: token,
               },
             },
           },
+        },
+        // The isolated Gateway inherits VITEST, where bundled plugins are not
+        // implicitly enabled. Activate the product plugin this proof exercises.
+        plugins: {
+          allow: ["telegram"],
+          entries: { telegram: { enabled: true } },
         },
       },
       env: {
         OPENCLAW_SKIP_CHANNELS: undefined,
         OPENCLAW_SKIP_PROVIDERS: undefined,
-        TELEGRAM_BOT_TOKEN: "qa-invalid-precedence-decoy",
+        OPENCLAW_TEST_MINIMAL_GATEWAY: undefined,
+        // Keep the isolated named account authoritative. A generic token would
+        // also activate the implicit default account and make Gateway readiness
+        // depend on an unrelated getMe probe.
+        TELEGRAM_BOT_TOKEN: undefined,
       },
       startTimeoutMs: options.startupTimeoutMs,
     });
     await instance.startGateway();
     await waitForProductStartup(instance, options.startupTimeoutMs);
-    writer.appendLog(sanitizeRuntimeLogs(instance.logs(), credential.token));
+    writer.appendLog(sanitizeRuntimeLogs(instance.logs(), token));
     writer.appendLog(
       "telegram-startup-getme: product startAccount resolved getMe bot identity before polling\n",
     );
     await instance.cleanup();
     instance = undefined;
+    await credentialHeartbeat.stop();
+    credentialHeartbeat.throwIfFailed();
+    credentialHeartbeat = undefined;
+    await credentialLease.release();
+    credentialLease = undefined;
     return await writer.write({
-      details: `Telegram product-startup getMe completed with ${credential.key}`,
+      details: `Telegram product-startup getMe completed with ${credentialLabel}`,
       durationMs: Math.max(1, Date.now() - startedAt),
       status: "pass",
     });
   } catch (error) {
-    const details = sanitizeRuntimeLogs(formatErrorMessage(error), credential.token);
+    const token = credentialLease?.payload.sutToken ?? directCredential?.token ?? "";
+    const details = sanitizeRuntimeLogs(formatErrorMessage(error), token);
     if (instance) {
-      writer.appendLog(sanitizeRuntimeLogs(instance.logs(), credential.token));
+      writer.appendLog(sanitizeRuntimeLogs(instance.logs(), token));
     }
     writer.appendLog(`telegram-startup-getme: ${details}\n`);
     return await writer.write({
@@ -213,11 +283,17 @@ export async function runTelegramBotTokenRuntime(
     });
   } finally {
     await instance?.cleanup().catch(() => undefined);
+    try {
+      await credentialHeartbeat?.stop();
+    } finally {
+      await credentialLease?.release();
+    }
   }
 }
 
 export const testing = {
   parseOptions,
+  parseTelegramCredentialPayload,
   resolveLeasedToken,
   sanitizeRuntimeLogs,
   waitForProductStartup,
@@ -226,8 +302,15 @@ export const testing = {
 if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
   runTelegramBotTokenRuntime(parseOptions(process.argv.slice(2)))
     .then((evidence) => {
-      const status = evidence.entries[0]?.result.status;
+      const result = evidence.entries[0]?.result;
+      if (!result) {
+        throw new Error("Telegram startup evidence did not contain a result");
+      }
+      const status = result.status;
       process.stdout.write(`telegram-startup-getme: ${status}\n`);
+      if (status === "fail") {
+        process.stderr.write(`telegram-startup-getme: ${result.failure?.reason ?? "failed"}\n`);
+      }
       process.exitCode = status === "fail" ? 1 : 0;
     })
     .catch((error: unknown) => {

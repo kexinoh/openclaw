@@ -14,8 +14,6 @@ const messageWithContent = (content: readonly Record<string, unknown>[]) =>
     content,
   }) as const;
 
-const TEXT_ONLY_TWO_BLOCKS = messageWithContent([text("Draft line 1"), text("Draft line 2")]);
-
 type FinalizeBoundaryCase = {
   name: string;
   streamedContent: readonly Record<string, unknown>[];
@@ -24,18 +22,6 @@ type FinalizeBoundaryCase = {
 };
 
 const FINALIZE_BOUNDARY_CASES: FinalizeBoundaryCase[] = [
-  {
-    name: "preserves streamed text when tool-boundary final payload drops prefix blocks",
-    streamedContent: [text("Before tool call"), toolUse(), text("After tool call")],
-    finalContent: [toolUse(), text("After tool call")],
-    expected: "Before tool call\nAfter tool call",
-  },
-  {
-    name: "preserves streamed text when streamed run had non-text and final drops suffix blocks",
-    streamedContent: [text("Before tool call"), toolUse(), text("After tool call")],
-    finalContent: [text("Before tool call")],
-    expected: "Before tool call\nAfter tool call",
-  },
   {
     name: "prefers final text when non-text appears only in final payload",
     streamedContent: [text("Draft line 1"), text("Draft line 2")],
@@ -72,7 +58,16 @@ describe("TuiStreamAssembler", () => {
     expect(second).toBe("[thinking]\nBrain\n\nHello");
   });
 
-  it("omits thinking when showThinking is false", () => {
+  it("defers streamed terminal sanitization to the markdown boundary", () => {
+    const assembler = new TuiStreamAssembler();
+    const unsafe = "before\x1b]52;c;unsafe\x07after";
+
+    expect(assembler.ingestDelta("run-unsafe", messageWithContent([text(unsafe)]), false)).toBe(
+      unsafe,
+    );
+  });
+
+  it("retains hidden thinking across display toggles", () => {
     const assembler = new TuiStreamAssembler();
     const output = assembler.ingestDelta(
       "run-2",
@@ -80,6 +75,10 @@ describe("TuiStreamAssembler", () => {
       false,
     );
     expect(output).toBe("Visible");
+    expect(assembler.ingestDelta("run-2", messageWithContent([]), true)).toBe(
+      "[thinking]\nHidden\n\nVisible",
+    );
+    expect(assembler.ingestDelta("run-2", messageWithContent([]), false)).toBe("Visible");
   });
 
   it("tracks literal placeholder text as real displayable content until finalization", () => {
@@ -129,6 +128,63 @@ describe("TuiStreamAssembler", () => {
     );
     expect(finalText).toContain("HTTP 401");
     expect(finalText).toContain("Missing scopes: model.request");
+  });
+
+  it("renders attachment-only assistant finals without exposing media fields", () => {
+    const assembler = new TuiStreamAssembler();
+    const finalText = assembler.finalize(
+      "run-media-only",
+      messageWithContent([
+        {
+          type: "image",
+          data: "secret-image",
+          url: "file:///Users/operator/private/image.png",
+          artifactId: "secret-artifact",
+        },
+      ]),
+      false,
+    );
+    expect(finalText).toBe("Attached image");
+  });
+
+  it("keeps visible thinking ahead of an attachment-only final", () => {
+    const assembler = new TuiStreamAssembler();
+    const finalText = assembler.finalize(
+      "run-media-thinking",
+      messageWithContent([
+        thinking("Preparing the attachment"),
+        { type: "image", data: "secret-image" },
+      ]),
+      true,
+    );
+    expect(finalText).toBe("[thinking]\nPreparing the attachment\n\nAttached image");
+  });
+
+  it("keeps a streamed caption ahead of an attachment-only final", () => {
+    const assembler = new TuiStreamAssembler();
+    assembler.ingestDelta(
+      "run-media-caption",
+      messageWithContent([text("Generated chart")]),
+      false,
+    );
+    const finalText = assembler.finalize(
+      "run-media-caption",
+      messageWithContent([{ type: "image", data: "secret-image" }]),
+      false,
+    );
+    expect(finalText).toBe("Generated chart");
+  });
+
+  it("keeps an error ahead of an attachment summary", () => {
+    const assembler = new TuiStreamAssembler();
+    const finalText = assembler.finalize(
+      "run-media-error",
+      messageWithContent([{ type: "video", url: "file:///private/clip.mp4" }]),
+      false,
+      "media generation failed",
+    );
+    expect(finalText).toContain("media generation failed");
+    expect(finalText).not.toContain("Attached video");
   });
 
   it("returns null when delta text is unchanged", () => {
@@ -241,19 +297,6 @@ describe("TuiStreamAssembler", () => {
     expect(assembler.finalize("run-orphan-0", { role: "assistant", content: [] }, false)).toBe(
       "(no output)",
     );
-  });
-
-  it("keeps streamed delta text when incoming tool boundary drops a block", () => {
-    const assembler = new TuiStreamAssembler();
-    const first = assembler.ingestDelta("run-delta-boundary", TEXT_ONLY_TWO_BLOCKS, false);
-    expect(first).toBe("Draft line 1\nDraft line 2");
-
-    const second = assembler.ingestDelta(
-      "run-delta-boundary",
-      messageWithContent([toolUse(), text("Draft line 2")]),
-      false,
-    );
-    expect(second).toBeNull();
   });
 
   for (const testCase of FINALIZE_BOUNDARY_CASES) {

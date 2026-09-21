@@ -1,4 +1,3 @@
-// Qa Lab plugin module implements credential lease behavior.
 import { randomUUID } from "node:crypto";
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
 import { expectDefined } from "openclaw/plugin-sdk/expect-runtime";
@@ -74,6 +73,7 @@ type QaCredentialLeaseHeartbeat = {
   getFailure(): Error | null;
   stop(): Promise<void>;
   throwIfFailed(): void;
+  whenFailed: Promise<Error>;
 };
 
 type QaCredentialRole = "ci" | "maintainer";
@@ -600,6 +600,7 @@ export function startQaCredentialLeaseHeartbeat(
       getFailure: () => null,
       async stop() {},
       throwIfFailed() {},
+      whenFailed: new Promise<Error>(() => {}),
     };
   }
   const intervalMs = opts?.intervalMs ?? lease.heartbeatIntervalMs;
@@ -608,6 +609,7 @@ export function startQaCredentialLeaseHeartbeat(
       getFailure: () => null,
       async stop() {},
       throwIfFailed() {},
+      whenFailed: new Promise<Error>(() => {}),
     };
   }
 
@@ -619,6 +621,10 @@ export function startQaCredentialLeaseHeartbeat(
   let stopped = false;
   let timer: ReturnType<typeof setTimeout> | null = null;
   let inFlight: Promise<void> | null = null;
+  let resolveFailure: (error: Error) => void = () => undefined;
+  const whenFailed = new Promise<Error>((resolve) => {
+    resolveFailure = resolve;
+  });
 
   const schedule = (delayMs = intervalMs) => {
     if (stopped || failure) {
@@ -646,6 +652,7 @@ export function startQaCredentialLeaseHeartbeat(
           failure = new Error(
             `Credential lease heartbeat failed for kind "${lease.kind}": ${formatErrorMessage(error)}`,
           );
+          resolveFailure(failure);
           return;
         } finally {
           inFlight = null;
@@ -658,6 +665,7 @@ export function startQaCredentialLeaseHeartbeat(
   schedule();
 
   return {
+    whenFailed,
     getFailure() {
       return failure;
     },

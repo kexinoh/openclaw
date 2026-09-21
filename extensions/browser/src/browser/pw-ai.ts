@@ -9,8 +9,9 @@ import {
   forceDisconnectPlaywrightForTarget,
   getObservedBrowserStateForPage,
   getObservedBrowserStateViaPlaywright,
-  getMainFrameDocumentIdentityViaPlaywright,
+  getDocumentIdentitiesViaPlaywright,
   getPageForTargetId,
+  hasCachedPlaywrightBrowserConnection,
   isBrowserObservedDialogBlockedError,
   listPagesViaPlaywright,
   markObservedDialogsHandledRemotelyForPage,
@@ -23,15 +24,16 @@ import {
   getConsoleMessagesViaPlaywright,
   getNetworkRequestsViaPlaywright,
   getPageErrorsViaPlaywright,
+  getPageTextViaPlaywright,
 } from "./pw-tools-core.activity.js";
 import {
   armDialogViaPlaywright,
   armFileUploadViaPlaywright,
+  downloadCurrentDocumentViaPlaywright,
   downloadViaPlaywright,
   uploadViaPlaywright,
   waitForDownloadViaPlaywright,
 } from "./pw-tools-core.downloads.js";
-import { pageContentViaPlaywright } from "./pw-tools-core.extract.js";
 import {
   batchViaPlaywright,
   clickViaPlaywright,
@@ -56,10 +58,9 @@ import {
   navigateViaPlaywright,
   pdfViaPlaywright,
   resizeViewportViaPlaywright,
-  snapshotAiViaPlaywright,
   snapshotAriaViaPlaywright,
   snapshotRoleViaPlaywright,
-  storeAriaSnapshotRefsViaPlaywright,
+  storeSnapshotRefsViaPlaywright,
 } from "./pw-tools-core.snapshot.js";
 import {
   emulateMediaViaPlaywright,
@@ -83,6 +84,7 @@ import {
 import { traceStartViaPlaywright, traceStopViaPlaywright } from "./pw-tools-core.trace.js";
 
 export const pwAi = {
+  downloadCurrentDocumentViaPlaywright,
   closePageByTargetIdViaPlaywright,
   closePlaywrightBrowserConnection,
   retirePlaywrightBrowserConnection,
@@ -94,8 +96,9 @@ export const pwAi = {
   createObservedDialogAbortSignalForPage,
   getObservedBrowserStateForPage,
   getObservedBrowserStateViaPlaywright,
-  getMainFrameDocumentIdentityViaPlaywright,
+  getDocumentIdentitiesViaPlaywright,
   getPageForTargetId,
+  hasCachedPlaywrightBrowserConnection,
   isBrowserObservedDialogBlockedError,
   listPagesViaPlaywright,
   markObservedDialogsHandledRemotelyForPage,
@@ -119,10 +122,10 @@ export const pwAi = {
   getConsoleMessagesViaPlaywright,
   getNetworkRequestsViaPlaywright,
   getPageErrorsViaPlaywright,
+  getPageTextViaPlaywright,
   highlightViaPlaywright,
   hoverViaPlaywright,
   navigateViaPlaywright,
-  pageContentViaPlaywright,
   pdfViaPlaywright,
   pressKeyViaPlaywright,
   resizeViewportViaPlaywright,
@@ -137,10 +140,9 @@ export const pwAi = {
   setLocaleViaPlaywright,
   setOfflineViaPlaywright,
   setTimezoneViaPlaywright,
-  snapshotAiViaPlaywright,
   snapshotAriaViaPlaywright,
   snapshotRoleViaPlaywright,
-  storeAriaSnapshotRefsViaPlaywright,
+  storeSnapshotRefsViaPlaywright,
   screenshotWithLabelsViaPlaywright,
   storageClearViaPlaywright,
   storageGetViaPlaywright,

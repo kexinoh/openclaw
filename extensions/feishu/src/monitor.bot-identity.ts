@@ -1,4 +1,3 @@
-// Feishu plugin module implements monitor.bot identity behavior.
 import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
 import type { RuntimeEnv } from "../runtime-api.js";
 import { waitForAbortableDelay } from "./async.js";
@@ -88,5 +87,9 @@ export function startBotIdentityRecovery(params: {
     );
   }
 
-  void retryBotIdentityProbe(account, accountId, runtime, abortSignal);
+  void retryBotIdentityProbe(account, accountId, runtime, abortSignal).catch((err: unknown) => {
+    (runtime?.error ?? console.error)(
+      `feishu[${accountId}]: bot identity background retry failed unexpectedly: ${String(err)}`,
+    );
+  });
 }

@@ -127,14 +127,16 @@ export function setupGoogleMeetPlugin(
             result: {
               ok: true,
               targetId: proxy.body?.targetId ?? "tab-1",
-              result: JSON.stringify(
-                options.browserActResult ?? {
+              result: JSON.stringify({
+                audioInputRouted: true,
+                audioOutputRouted: true,
+                ...(options.browserActResult ?? {
                   inCall: true,
                   micMuted: false,
                   title: "Meet call",
                   url: MEET_URL,
-                },
-              ),
+                }),
+              }),
             },
           },
         };
@@ -148,7 +150,7 @@ export function setupGoogleMeetPlugin(
       if (options.runCommandWithTimeoutHandler) {
         return options.runCommandWithTimeoutHandler(argv, runOptions);
       }
-      if (argv[0] === "/usr/sbin/system_profiler") {
+      if (argv[0]?.endsWith("system_profiler")) {
         return { code: 0, stdout: "BlackHole 2ch", stderr: "" };
       }
       return { code: 0, stdout: "", stderr: "" };
@@ -189,6 +191,9 @@ export function setupGoogleMeetPlugin(
     logger: noopLogger,
     registerGatewayMethod: (method: string, handler: unknown) => methods.set(method, handler),
     registerTool: (tool) => {
+      if (typeof tool !== "function" && "contextVersion" in tool) {
+        throw new Error("expected legacy Google Meet registration");
+      }
       const registered = typeof tool === "function" ? tool(options.toolContext ?? {}) : tool;
       if (Array.isArray(registered)) {
         tools.push(...registered);

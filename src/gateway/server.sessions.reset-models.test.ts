@@ -9,15 +9,17 @@ import { loadSessionEntry, replaceSessionEntry } from "../config/sessions/sessio
 import type { SessionEntry } from "../config/sessions/types.js";
 import { MODEL_SELECTION_LOCKED_RESET_MESSAGE } from "../sessions/model-overrides.js";
 import { listSessionStateEventsSince } from "../sessions/session-state-events.js";
+import { ensureProfileForEmail, setUserProfileRole } from "../state/user-profiles.js";
 import { normalizeSessionDeliveryState } from "../utils/delivery-context.shared.js";
 import { testState, writeSessionStore } from "./test-helpers.js";
 import {
-  setupGatewaySessionsTestHarness,
+  setupGatewaySessionsHandlerTestHarness,
   sessionStoreEntry,
   directSessionReq,
+  writeSingleLineSession,
 } from "./test/server-sessions.test-helpers.js";
 
-const { createSessionStoreDir } = setupGatewaySessionsTestHarness();
+const { createSessionStoreDir } = setupGatewaySessionsHandlerTestHarness();
 
 type ResetSessionEntry = {
   sessionId?: string;
@@ -32,9 +34,13 @@ type ResetSessionEntry = {
   spawnedWorkspaceDir?: string;
   spawnedCwd?: string;
   parentSessionKey?: string;
+  parentSessionId?: string;
   createdVia?: string;
   createdActor?: { type: string; id?: string };
   createdAt?: number;
+  sandbox?: "required";
+  sandboxMode?: "off";
+  nativeRuntimeConsent?: string;
   forkSource?: { sessionKey: string; sessionId: string; entryId?: string };
   previousSessionId?: string;
   forkedFromParent?: boolean;
@@ -60,8 +66,6 @@ type ResetSessionEntry = {
   groupActivation?: string;
   groupActivationNeedsSystemIntro?: boolean;
   execHost?: string;
-  execSecurity?: string;
-  execAsk?: string;
   execNode?: string;
   displayName?: string;
   cliSessionBindings?: Record<
@@ -76,6 +80,7 @@ type ResetSessionEntry = {
   cliSessionIds?: Record<string, string>;
   claudeCliSessionId?: string;
   label?: string;
+  autoLabel?: string;
 };
 
 type ModelResetEntry = Pick<
@@ -103,6 +108,7 @@ test("sessions.reset stamps provenance when it materializes a missing row", asyn
     createdActor: { type: "human", id: "profile-reset-creator" },
     createdAt: expect.any(Number),
   });
+  expect(reset.payload?.entry).not.toHaveProperty("sandbox");
   expect(
     listSessionStateEventsSince("agent:main:subagent:missing", "main", 0, 20).events,
   ).toContainEqual(
@@ -112,6 +118,50 @@ test("sessions.reset stamps provenance when it materializes a missing row", asyn
       actorId: "profile-reset-creator",
     }),
   );
+});
+
+test("sessions.reset stamps the creator's required sandbox only when materializing a new row", async () => {
+  const { storePath } = await createSessionStoreDir();
+  const profile = ensureProfileForEmail("sandboxed-reset-creator@example.test");
+  setUserProfileRole(profile.id, "guest");
+  const { writeConfigFile } = await import("../config/config.js");
+  await writeConfigFile({
+    gateway: {
+      roles: {
+        default: "guest",
+        definitions: {
+          guest: {
+            sessions: { others: "none" },
+            agents: ["main"],
+            scopes: ["operator.read", "operator.write"],
+            sandbox: "required",
+          },
+        },
+      },
+    },
+  });
+
+  try {
+    const key = "agent:main:subagent:sandboxed-reset";
+    const reset = await directSessionReq<{ entry: ResetSessionEntry }>(
+      "sessions.reset",
+      { key },
+      {
+        client: {
+          authenticatedUserProfile: { profileId: profile.id },
+        } as never,
+      },
+    );
+
+    expect(reset.ok, JSON.stringify(reset.error)).toBe(true);
+    expect(reset.payload?.entry).toMatchObject({
+      createdActor: { type: "human", id: profile.id },
+      sandbox: "required",
+    });
+    expect(loadSessionEntry({ sessionKey: key, storePath })?.sandbox).toBe("required");
+  } finally {
+    await writeConfigFile({});
+  }
 });
 
 const ownedChildMetadata = {
@@ -130,10 +180,16 @@ const ownedChildMetadata = {
   groupChannel: "dev",
   space: "hq",
   spawnedBy: "agent:main:main",
+  completionOwnerSessionKey: "agent:main:discord:direct:alice",
+  inheritedToolPolicyVersion: 1,
+  inheritedToolAllow: ["read", "message"],
+  inheritedToolDeny: ["exec"],
   spawnedWorkspaceDir: "/tmp/child-workspace",
   spawnedCwd: "/tmp/task-repo",
   parentSessionKey: "agent:main:main",
+  parentSessionId: "sess-parent",
   forkedFromParent: true,
+  sandbox: "required",
   spawnDepth: 2,
   subagentRole: "orchestrator",
   subagentControlScope: "children",
@@ -153,8 +209,6 @@ const ownedChildMetadata = {
   groupActivation: "always",
   groupActivationNeedsSystemIntro: true,
   execHost: "gateway",
-  execSecurity: "allowlist",
-  execAsk: "on-miss",
   execNode: "mac-mini",
   displayName: "Ops Child",
   cliSessionIds: {
@@ -169,6 +223,7 @@ const ownedChildMetadata = {
   },
   claudeCliSessionId: "cli-session-123",
   label: "owned child",
+  autoLabel: "Device",
 } satisfies SessionEntryOverrides & ResetSessionEntry;
 
 function expectSqliteSessionFile(entry: ResetSessionEntry | undefined) {
@@ -297,6 +352,59 @@ test("sessions.reset recomputes model from defaults instead of stale runtime mod
   expect(reset.payload?.entry.modelProvider).toBe("openai");
   expect(reset.payload?.entry.model).toBe("gpt-test-a");
   expect(reset.payload?.entry.contextTokens).toBeUndefined();
+});
+
+test("sessions.reset retains sandbox choice but requires fresh native runtime consent", async () => {
+  const { storePath } = await createSessionStoreDir();
+  await writeSessionStore({
+    entries: {
+      main: sessionStoreEntry("sandbox-opt-out", {
+        sandboxMode: "off",
+        nativeRuntimeConsent: "native-fixture",
+      }),
+    },
+  });
+  const reset = await directSessionReq<{ entry: ResetSessionEntry }>("sessions.reset", {
+    key: "main",
+  });
+  expect(reset.ok).toBe(true);
+  expect(reset.payload?.entry.sandboxMode).toBe("off");
+  expect(loadSessionEntry({ sessionKey: "agent:main:main", storePath })?.sandboxMode).toBe("off");
+  expect(reset.payload?.entry.nativeRuntimeConsent).toBeUndefined();
+  expect(loadSessionEntry({ sessionKey: "agent:main:main", storePath })).not.toHaveProperty(
+    "nativeRuntimeConsent",
+  );
+});
+test("sessions.reset preserves the selected runtime and retires native conversation bindings", async () => {
+  const { dir, storePath } = await createSessionStoreDir();
+  await writeSingleLineSession(dir, "sess-main", "old conversation");
+  await writeSessionStore({
+    entries: {
+      main: {
+        ...sessionStoreEntry("sess-main"),
+        lifecycleRevision: "old-lifecycle",
+        providerOverride: "provider-a",
+        modelOverride: "opaque/model",
+        modelOverrideSource: "user",
+        agentRuntimeOverride: "native-runtime",
+        agentHarnessId: "previous-runtime",
+        cliSessionIds: { "previous-runtime": "old-native-session" },
+      },
+    },
+  });
+  const response = await directSessionReq("sessions.reset", { key: "main" });
+  expect(response.ok).toBe(true);
+  const entry = loadSessionEntry({ agentId: "main", sessionKey: "agent:main:main", storePath });
+  expect(entry).toMatchObject({
+    sessionId: "sess-main",
+    providerOverride: "provider-a",
+    modelOverride: "opaque/model",
+    modelOverrideSource: "user",
+    agentRuntimeOverride: "native-runtime",
+  });
+  expect(entry?.lifecycleRevision).not.toBe("old-lifecycle");
+  expect(entry?.agentHarnessId).toBeUndefined();
+  expect(entry?.cliSessionIds).toBeUndefined();
 });
 
 test("sessions.reset clears stale estimated context budget status", async () => {

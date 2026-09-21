@@ -1,120 +1,28 @@
-import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import {
-  buildAgentRunTerminalOutcome,
+  classifyAgentRunTerminalOutcome,
   type AgentRunTerminalOutcome,
 } from "../agents/agent-run-terminal-outcome.js";
 import { SUBAGENT_KILL_TASK_ERROR } from "./detached-task-runtime-contract.js";
-import { isTerminalTaskStatus } from "./task-executor-policy.js";
-import type { TaskFlowRecord } from "./task-flow-registry.types.js";
-import { ensureTaskFlowRegistryReady, getTaskFlowById } from "./task-flow-runtime-internal.js";
-import type {
-  TaskDeliveryState,
-  TaskDeliveryStatus,
-  TaskEventKind,
-  TaskEventRecord,
-  TaskNotifyPolicy,
-  TaskRecord,
-  TaskRuntime,
-  TaskScopeKind,
-  TaskStatus,
-  TaskTerminalOutcome,
+import {
+  isTerminalTaskStatus,
+  type TaskDeliveryStatus,
+  type TaskEventKind,
+  type TaskEventRecord,
+  type TaskNotifyPolicy,
+  type TaskRuntime,
+  type TaskScopeKind,
+  type TaskStatus,
+  type TaskTerminalOutcome,
 } from "./task-registry.types.js";
-
-export type TaskDeliveryOwner = {
-  sessionKey?: string;
-  requesterOrigin?: TaskDeliveryState["requesterOrigin"];
-  flowId?: string;
-};
-
-type ParentFlowLinkErrorCode =
-  | "scope_kind_not_session"
-  | "parent_flow_not_found"
-  | "owner_key_mismatch"
-  | "cancel_requested"
-  | "terminal";
-
-class ParentFlowLinkError extends Error {
-  constructor(
-    public readonly code: ParentFlowLinkErrorCode,
-    message: string,
-    public readonly details?: {
-      flowId?: string;
-      status?: TaskFlowRecord["status"];
-    },
-  ) {
-    super(message);
-    this.name = "ParentFlowLinkError";
-  }
-}
-
-export function isParentFlowLinkError(error: unknown): error is ParentFlowLinkError {
-  return error instanceof ParentFlowLinkError;
-}
 
 export function isActiveTaskStatus(status: TaskStatus): boolean {
   return status === "queued" || status === "running";
-}
-
-export function isTerminalFlowStatus(status: TaskFlowRecord["status"]): boolean {
-  return (
-    status === "succeeded" || status === "failed" || status === "cancelled" || status === "lost"
-  );
 }
 
 export function assertTaskOwner(params: { ownerKey: string; scopeKind: TaskScopeKind }) {
   const ownerKey = params.ownerKey.trim();
   if (!ownerKey && params.scopeKind !== "system") {
     throw new Error("Task ownerKey is required.");
-  }
-}
-
-export function assertParentFlowLinkAllowed(params: {
-  ownerKey: string;
-  scopeKind: TaskScopeKind;
-  parentFlowId?: string;
-}) {
-  const flowId = params.parentFlowId?.trim();
-  if (!flowId) {
-    return;
-  }
-  if (params.scopeKind !== "session") {
-    throw new ParentFlowLinkError(
-      "scope_kind_not_session",
-      "Only session-scoped tasks can link to flows.",
-      { flowId },
-    );
-  }
-  const flow = getTaskFlowById(flowId);
-  if (!flow) {
-    throw new ParentFlowLinkError("parent_flow_not_found", `Parent flow not found: ${flowId}`, {
-      flowId,
-    });
-  }
-  if (normalizeOptionalString(flow.ownerKey) !== normalizeOptionalString(params.ownerKey)) {
-    throw new ParentFlowLinkError(
-      "owner_key_mismatch",
-      "Task ownerKey must match parent flow ownerKey.",
-      { flowId },
-    );
-  }
-  if (flow.cancelRequestedAt != null) {
-    throw new ParentFlowLinkError(
-      "cancel_requested",
-      "Parent flow cancellation has already been requested.",
-      { flowId, status: flow.status },
-    );
-  }
-  if (isTerminalFlowStatus(flow.status)) {
-    throw new ParentFlowLinkError("terminal", `Parent flow is already ${flow.status}.`, {
-      flowId,
-      status: flow.status,
-    });
-  }
-}
-
-export function ensureLinkedTaskFlowRegistryReady(task: Pick<TaskRecord, "parentFlowId">): void {
-  if (task.parentFlowId?.trim()) {
-    ensureTaskFlowRegistryReady();
   }
 }
 
@@ -265,59 +173,32 @@ export function resolveTaskTerminalOutcome(params: {
   return params.status === "succeeded" ? "succeeded" : undefined;
 }
 
+const TASK_STATUS_BY_TERMINAL_CLASSIFICATION = {
+  success: "succeeded",
+  timeout: "timed_out",
+  cancellation: "cancelled",
+  failure: "failed",
+} as const;
+
 export function mapAgentRunTerminalOutcomeToTaskStatus(
   outcome: AgentRunTerminalOutcome,
 ): Extract<TaskStatus, "succeeded" | "failed" | "timed_out" | "cancelled"> {
-  switch (outcome.reason) {
-    case "completed":
-      return "succeeded";
-    case "hard_timeout":
-    case "timed_out":
-      return "timed_out";
-    case "cancelled":
-    case "aborted":
-      return "cancelled";
-    case "blocked":
-    case "abandoned":
-    case "failed":
-      return "failed";
-    default:
-      return outcome.reason satisfies never;
-  }
+  return TASK_STATUS_BY_TERMINAL_CLASSIFICATION[classifyAgentRunTerminalOutcome(outcome)];
 }
 
 export function resolveTaskLifecycleTerminalError(params: {
   runtime: TaskRuntime;
   status: TaskStatus;
+  terminalReason?: AgentRunTerminalOutcome["reason"];
   error?: string;
 }): string | undefined {
   // A runner abort can race either an accepted task cancellation or a real
   // completion. Keep it provisional until the task-control owner decides.
-  return params.runtime === "subagent" && params.status === "cancelled"
+  return params.runtime === "subagent" &&
+    params.status === "cancelled" &&
+    params.terminalReason !== "superseded"
     ? SUBAGENT_KILL_TASK_ERROR
     : params.error;
-}
-
-export function buildTaskLifecycleTerminalOutcome(params: {
-  phase: "end" | "error";
-  data?: Record<string, unknown>;
-  startedAt?: number;
-  endedAt?: number;
-}): AgentRunTerminalOutcome {
-  const status =
-    params.phase === "error" ? "error" : params.data?.aborted === true ? "timeout" : "ok";
-  // Lifecycle events carry runner/provider terminal facts. Keep the precedence
-  // centralized so task projections match agent.wait and gateway snapshots.
-  return buildAgentRunTerminalOutcome({
-    status,
-    error: params.data?.error,
-    stopReason: params.data?.stopReason,
-    livenessState: params.data?.livenessState,
-    timeoutPhase: params.data?.timeoutPhase,
-    providerStarted: params.data?.providerStarted,
-    startedAt: params.startedAt,
-    endedAt: params.endedAt,
-  });
 }
 
 export function appendTaskEvent(event: {

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { CronJob } from "../cron/types.js";
+import { createDeferred } from "../../test/helpers/promise.js";
 import type {
   ManagedRun,
   ProcessSupervisor,
@@ -7,12 +7,21 @@ import type {
   SpawnInput,
 } from "../process/supervisor/types.js";
 import {
+  createCronStreamMatchingJob,
+  createCronStreamWatcherFixture,
   createWatchers,
   exitResult,
   fakeSupervisor,
   job,
   settle,
 } from "./cron-stream-watchers.test-helpers.js";
+
+vi.mock("./cron-stream-matcher.js", () => ({
+  matchCronStreamLines: async (pattern: string, lines: string[]) => {
+    const matcher = new RegExp(pattern);
+    return lines.some((line) => matcher.test(line));
+  },
+}));
 
 describe("cron stream output", () => {
   afterEach(() => {
@@ -21,31 +30,8 @@ describe("cron stream output", () => {
 
   it("batches stdout and stderr, filters match mode, and truncates at the byte cap", async () => {
     vi.useFakeTimers();
-    const fake = fakeSupervisor();
-    const fireBatch = vi.fn(async (_job: CronJob, _batch: string) => "fired" as const);
-    const watchers = createWatchers({
-      getProcessSupervisor: () => fake.supervisor,
-      minIntervalMs: 1,
-      updateState: vi.fn(async () => {}),
-      recordFailure: vi.fn(async () => {}),
-      fireBatch,
-      logger: { info: vi.fn(), warn: vi.fn() },
-    });
-    await watchers.reconcile(
-      [
-        job({
-          schedule: {
-            kind: "stream",
-            command: ["stream-source"],
-            mode: "match",
-            match: "^keep",
-            batchMs: 50,
-            maxBatchBytes: 1_024,
-          },
-        }),
-      ],
-      true,
-    );
+    const { fake, fireBatch, watchers } = createCronStreamWatcherFixture({ minIntervalMs: 1 });
+    await watchers.reconcile([createCronStreamMatchingJob("^keep")], true);
     await settle();
 
     fake.inputs[0]?.onStdout?.("drop this\nkeep one\n");
@@ -68,28 +54,8 @@ describe("cron stream output", () => {
 
   it("does not match an oversized line by its truncated prefix", async () => {
     vi.useFakeTimers();
-    const fake = fakeSupervisor();
-    const fireBatch = vi.fn(async (_job: CronJob, _batch: string) => "fired" as const);
-    const watchers = createWatchers({
-      getProcessSupervisor: () => fake.supervisor,
-      minIntervalMs: 1,
-      updateState: vi.fn(async () => {}),
-      recordFailure: vi.fn(async () => {}),
-      fireBatch,
-      logger: { info: vi.fn(), warn: vi.fn() },
-    });
-    await watchers.start(
-      job({
-        schedule: {
-          kind: "stream",
-          command: ["stream-source"],
-          mode: "match",
-          match: "^keep",
-          batchMs: 50,
-          maxBatchBytes: 1_024,
-        },
-      }),
-    );
+    const { fake, fireBatch, watchers } = createCronStreamWatcherFixture({ minIntervalMs: 1 });
+    await watchers.start(createCronStreamMatchingJob("^keep"));
 
     // A complete line longer than the batch cap was still matched in full;
     // it fires and only the delivered batch is truncated.
@@ -112,69 +78,32 @@ describe("cron stream output", () => {
     await watchers.stopAll("shutdown");
   });
 
-  it("matches an over-cap line identically whether or not callbacks split it", async () => {
-    vi.useFakeTimers();
-    const fake = fakeSupervisor();
-    const fireBatch = vi.fn(async (_job: CronJob, _batch: string) => "fired" as const);
-    const watchers = createWatchers({
-      getProcessSupervisor: () => fake.supervisor,
-      minIntervalMs: 1,
-      updateState: vi.fn(async () => {}),
-      recordFailure: vi.fn(async () => {}),
-      fireBatch,
-      logger: { info: vi.fn(), warn: vi.fn() },
-    });
-    await watchers.start(
-      job({
-        schedule: {
-          kind: "stream",
-          command: ["stream-source"],
-          mode: "match",
-          match: "^keep",
-          batchMs: 50,
-          maxBatchBytes: 1_024,
-        },
-      }),
-    );
+  it.each([false, true])(
+    "matches a complete long line before truncating its batch (split callbacks: %s)",
+    async (split) => {
+      vi.useFakeTimers();
+      const { fake, fireBatch, watchers } = createCronStreamWatcherFixture({ minIntervalMs: 1 });
+      await watchers.start(createCronStreamMatchingJob("^build-start .* build-complete$"));
 
-    // A complete 1.9 KB line arriving in two callbacks must match exactly
-    // like the same line in one callback: pipe chunking is not semantics.
-    fake.inputs[0]?.onStdout?.(`keep ${"x".repeat(1_500)}`);
-    await settle();
-    fake.inputs[0]?.onStdout?.(`${"x".repeat(400)}\n`);
-    await settle();
-    await vi.advanceTimersByTimeAsync(100);
-    await settle();
-    expect(fireBatch).toHaveBeenCalledOnce();
-    expect(fireBatch.mock.calls[0]?.[1]).toMatch(/^keep x/u);
-    expect(fireBatch.mock.calls[0]?.[1]).toMatch(/\[truncated\]$/u);
-    await watchers.stopAll("shutdown");
-  });
+      const line = `build-start ${"x".repeat(3_000)} build-complete\n`;
+      const chunks = split ? [line.slice(0, 1_500), line.slice(1_500)] : [line];
+      for (const chunk of chunks) {
+        fake.inputs[0]?.onStdout?.(chunk);
+        await settle();
+      }
+      await vi.advanceTimersByTimeAsync(100);
+      await settle();
+      expect(fireBatch).toHaveBeenCalledOnce();
+      expect(fireBatch.mock.calls[0]?.[1]).toMatch(/^build-start x/u);
+      expect(fireBatch.mock.calls[0]?.[1]).toMatch(/\[truncated\]$/u);
+      await watchers.stopAll("shutdown");
+    },
+  );
 
   it("treats a line over the intake bound as an unprovable prefix even when callbacks split it", async () => {
     vi.useFakeTimers();
-    const fake = fakeSupervisor();
-    const fireBatch = vi.fn(async (_job: CronJob, _batch: string) => "fired" as const);
-    const watchers = createWatchers({
-      getProcessSupervisor: () => fake.supervisor,
-      minIntervalMs: 1,
-      updateState: vi.fn(async () => {}),
-      recordFailure: vi.fn(async () => {}),
-      fireBatch,
-      logger: { info: vi.fn(), warn: vi.fn() },
-    });
-    await watchers.start(
-      job({
-        schedule: {
-          kind: "stream",
-          command: ["stream-source"],
-          mode: "match",
-          match: "^keep",
-          batchMs: 50,
-          maxBatchBytes: 1_024,
-        },
-      }),
-    );
+    const { fake, fireBatch, watchers } = createCronStreamWatcherFixture({ minIntervalMs: 1 });
+    await watchers.start(createCronStreamMatchingJob("^keep"));
 
     // Each fragment fits the per-drain intake budget, but the assembled line
     // exceeds the 4x raw-intake bound. It must stay unmatched exactly like the
@@ -202,28 +131,8 @@ describe("cron stream output", () => {
 
   it("matches raw source text without treating the truncation marker as input", async () => {
     vi.useFakeTimers();
-    const fake = fakeSupervisor();
-    const fireBatch = vi.fn(async (_job: CronJob, _batch: string) => "fired" as const);
-    const watchers = createWatchers({
-      getProcessSupervisor: () => fake.supervisor,
-      minIntervalMs: 1,
-      updateState: vi.fn(async () => {}),
-      recordFailure: vi.fn(async () => {}),
-      fireBatch,
-      logger: { info: vi.fn(), warn: vi.fn() },
-    });
-    await watchers.start(
-      job({
-        schedule: {
-          kind: "stream",
-          command: ["stream-source"],
-          mode: "match",
-          match: "\\[truncated\\]$",
-          batchMs: 50,
-          maxBatchBytes: 1_024,
-        },
-      }),
-    );
+    const { fake, fireBatch, watchers } = createCronStreamWatcherFixture({ minIntervalMs: 1 });
+    await watchers.start(createCronStreamMatchingJob("\\[truncated\\]$"));
 
     fake.inputs[0]?.onStdout?.(`${"x".repeat(2_000)}\n`);
     await settle();
@@ -242,28 +151,8 @@ describe("cron stream output", () => {
 
   it("does not synthesize a line across dropped output chunks", async () => {
     vi.useFakeTimers();
-    const fake = fakeSupervisor();
-    const fireBatch = vi.fn(async (_job: CronJob, _batch: string) => "fired" as const);
-    const watchers = createWatchers({
-      getProcessSupervisor: () => fake.supervisor,
-      minIntervalMs: 1,
-      updateState: vi.fn(async () => {}),
-      recordFailure: vi.fn(async () => {}),
-      fireBatch,
-      logger: { info: vi.fn(), warn: vi.fn() },
-    });
-    await watchers.start(
-      job({
-        schedule: {
-          kind: "stream",
-          command: ["stream-source"],
-          mode: "match",
-          match: "^keep$",
-          batchMs: 50,
-          maxBatchBytes: 1_024,
-        },
-      }),
-    );
+    const { fake, fireBatch, watchers } = createCronStreamWatcherFixture({ minIntervalMs: 1 });
+    await watchers.start(createCronStreamMatchingJob("^keep$"));
 
     // Real source lines: "kee<dropped continuation>" then "p" then "keep".
     // Synchronous burst: stdout partial, stderr filler that exhausts the byte
@@ -291,28 +180,8 @@ describe("cron stream output", () => {
 
   it("does not match a retained prefix when its continuation was dropped before exit", async () => {
     vi.useFakeTimers();
-    const fake = fakeSupervisor();
-    const fireBatch = vi.fn(async (_job: CronJob, _batch: string) => "fired" as const);
-    const watchers = createWatchers({
-      getProcessSupervisor: () => fake.supervisor,
-      minIntervalMs: 1,
-      updateState: vi.fn(async () => {}),
-      recordFailure: vi.fn(async () => {}),
-      fireBatch,
-      logger: { info: vi.fn(), warn: vi.fn() },
-    });
-    await watchers.start(
-      job({
-        schedule: {
-          kind: "stream",
-          command: ["stream-source"],
-          mode: "match",
-          match: "^keep$",
-          batchMs: 50,
-          maxBatchBytes: 1_024,
-        },
-      }),
-    );
+    const { fake, fireBatch, watchers } = createCronStreamWatcherFixture({ minIntervalMs: 1 });
+    await watchers.start(createCronStreamMatchingJob("^keep$"));
 
     // The retained prefix looks like a complete match, but the dropped chunk
     // continued that source line. EOF cannot prove where the real line ended.
@@ -329,28 +198,8 @@ describe("cron stream output", () => {
 
   it("does not discard the first clean line after a drop that ended at a newline", async () => {
     vi.useFakeTimers();
-    const fake = fakeSupervisor();
-    const fireBatch = vi.fn(async (_job: CronJob, _batch: string) => "fired" as const);
-    const watchers = createWatchers({
-      getProcessSupervisor: () => fake.supervisor,
-      minIntervalMs: 1,
-      updateState: vi.fn(async () => {}),
-      recordFailure: vi.fn(async () => {}),
-      fireBatch,
-      logger: { info: vi.fn(), warn: vi.fn() },
-    });
-    await watchers.start(
-      job({
-        schedule: {
-          kind: "stream",
-          command: ["stream-source"],
-          mode: "match",
-          match: "^keep$",
-          batchMs: 50,
-          maxBatchBytes: 1_024,
-        },
-      }),
-    );
+    const { fake, fireBatch, watchers } = createCronStreamWatcherFixture({ minIntervalMs: 1 });
+    await watchers.start(createCronStreamMatchingJob("^keep$"));
 
     // Synchronous burst exhausts the intake budget, then a whole chunk that
     // ends at a newline is dropped. The drop closed its own broken line, so
@@ -369,14 +218,16 @@ describe("cron stream output", () => {
 
   it("buffers output emitted before the asynchronous spawn call resolves", async () => {
     vi.useFakeTimers();
-    let resolveWait!: (exit: RunExit) => void;
-    const wait = new Promise<RunExit>((resolve) => {
-      resolveWait = resolve;
-    });
+    const { promise: wait, resolve: resolveWait } = createDeferred<RunExit>();
+    const activity = { resultSettled: false, lastOutputAtMs: Date.now() };
     const run: ManagedRun = {
+      activity,
       runId: "early-output",
       startedAtMs: Date.now(),
-      cancel: vi.fn(() => resolveWait(exitResult({ reason: "manual-cancel" }))),
+      cancel: vi.fn(() => {
+        activity.resultSettled = true;
+        resolveWait(exitResult({ reason: "manual-cancel" }));
+      }),
       detachOutput: vi.fn(),
       wait: () => wait,
     };
@@ -385,10 +236,8 @@ describe("cron stream output", () => {
       return run;
     });
     const supervisor = {
+      ...fakeSupervisor().supervisor,
       spawn,
-      cancel: vi.fn(),
-      cancelScope: vi.fn(),
-      getRecord: vi.fn(),
     } satisfies ProcessSupervisor;
     const fireBatch = vi.fn(async () => "fired" as const);
     const watchers = createWatchers({
@@ -415,11 +264,7 @@ describe("cron stream output", () => {
   it("keeps one bounded pending batch while a payload is busy and honors minimum spacing", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(1_000);
-    const fake = fakeSupervisor();
-    let releaseFirst!: () => void;
-    const first = new Promise<void>((resolve) => {
-      releaseFirst = resolve;
-    });
+    const { promise: first, resolve: releaseFirst } = createDeferred();
     const fireBatch = vi
       .fn()
       .mockImplementationOnce(async () => {
@@ -427,14 +272,9 @@ describe("cron stream output", () => {
         return "fired" as const;
       })
       .mockResolvedValue("fired" as const);
-    const updateState = vi.fn(async (_jobId: string, _patch: Partial<CronJob["state"]>) => {});
-    const watchers = createWatchers({
-      getProcessSupervisor: () => fake.supervisor,
+    const { fake, updateState, watchers } = createCronStreamWatcherFixture({
       minIntervalMs: 100,
-      updateState,
-      recordFailure: vi.fn(async () => {}),
       fireBatch,
-      logger: { info: vi.fn(), warn: vi.fn() },
     });
     await watchers.reconcile([job()], true);
     await settle();
@@ -471,11 +311,7 @@ describe("cron stream output", () => {
   it("prepends a busy retry ahead of batches that arrived while it was in flight", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(1_000);
-    const fake = fakeSupervisor();
-    let releaseFirst!: () => void;
-    const first = new Promise<void>((resolve) => {
-      releaseFirst = resolve;
-    });
+    const { promise: first, resolve: releaseFirst } = createDeferred();
     const fireBatch = vi
       .fn()
       .mockImplementationOnce(async () => {
@@ -483,13 +319,9 @@ describe("cron stream output", () => {
         return "busy" as const;
       })
       .mockResolvedValue("fired" as const);
-    const watchers = createWatchers({
-      getProcessSupervisor: () => fake.supervisor,
+    const { fake, watchers } = createCronStreamWatcherFixture({
       minIntervalMs: 1,
-      updateState: vi.fn(async () => {}),
-      recordFailure: vi.fn(async () => {}),
       fireBatch,
-      logger: { info: vi.fn(), warn: vi.fn() },
     });
     await watchers.start(job());
 
@@ -517,22 +349,13 @@ describe("cron stream output", () => {
 
   it("serializes exact coalesced counter updates under sustained output", async () => {
     vi.useFakeTimers();
-    const fake = fakeSupervisor();
-    let releasePayload!: () => void;
-    const payload = new Promise<void>((resolve) => {
-      releasePayload = resolve;
-    });
-    const updateState = vi.fn(async (_jobId: string, _patch: Partial<CronJob["state"]>) => {});
-    const watchers = createWatchers({
-      getProcessSupervisor: () => fake.supervisor,
+    const { promise: payload, resolve: releasePayload } = createDeferred();
+    const { fake, updateState, watchers } = createCronStreamWatcherFixture({
       minIntervalMs: 1,
-      updateState,
-      recordFailure: vi.fn(async () => {}),
       fireBatch: vi.fn(async () => {
         await payload;
         return "fired" as const;
       }),
-      logger: { info: vi.fn(), warn: vi.fn() },
     });
     await watchers.reconcile([job()], true);
     await settle();
@@ -557,15 +380,9 @@ describe("cron stream output", () => {
 
   it("counts a gate drop in the serialized owner", async () => {
     vi.useFakeTimers();
-    const fake = fakeSupervisor();
-    const updateState = vi.fn(async (_jobId: string, _patch: Partial<CronJob["state"]>) => {});
-    const watchers = createWatchers({
-      getProcessSupervisor: () => fake.supervisor,
+    const { fake, updateState, watchers } = createCronStreamWatcherFixture({
       minIntervalMs: 1,
-      updateState,
-      recordFailure: vi.fn(async () => {}),
       fireBatch: vi.fn(async () => "dropped" as const),
-      logger: { info: vi.fn(), warn: vi.fn() },
     });
     await watchers.reconcile([job()], true);
     await settle();
@@ -584,19 +401,13 @@ describe("cron stream output", () => {
 
   it("counts payload errors and rejected dispatches in the serialized owner", async () => {
     vi.useFakeTimers();
-    const fake = fakeSupervisor();
-    const updateState = vi.fn(async (_jobId: string, _patch: Partial<CronJob["state"]>) => {});
     const fireBatch = vi
       .fn<() => Promise<"error">>()
       .mockResolvedValueOnce("error")
       .mockRejectedValueOnce(new Error("dispatch failed"));
-    const watchers = createWatchers({
-      getProcessSupervisor: () => fake.supervisor,
+    const { fake, updateState, watchers } = createCronStreamWatcherFixture({
       minIntervalMs: 1,
-      updateState,
-      recordFailure: vi.fn(async () => {}),
       fireBatch,
-      logger: { info: vi.fn(), warn: vi.fn() },
     });
     await watchers.reconcile([job()], true);
     await settle();
@@ -626,15 +437,9 @@ describe("cron stream output", () => {
 
   it("counts a batch lost when fire dispatch rejects before cron can persist it", async () => {
     vi.useFakeTimers();
-    const fake = fakeSupervisor();
-    const updateState = vi.fn(async (_jobId: string, _patch: Partial<CronJob["state"]>) => {});
-    const watchers = createWatchers({
-      getProcessSupervisor: () => fake.supervisor,
+    const { fake, updateState, watchers } = createCronStreamWatcherFixture({
       minIntervalMs: 1,
-      updateState,
-      recordFailure: vi.fn(async () => {}),
       fireBatch: vi.fn(async () => await Promise.reject(new Error("transient failure"))),
-      logger: { info: vi.fn(), warn: vi.fn() },
     });
     await watchers.reconcile([job()], true);
     await settle();
@@ -654,16 +459,7 @@ describe("cron stream output", () => {
 
   it("fires a batch for an empty line accepted by match mode", async () => {
     vi.useFakeTimers();
-    const fake = fakeSupervisor();
-    const fireBatch = vi.fn(async () => "fired" as const);
-    const watchers = createWatchers({
-      getProcessSupervisor: () => fake.supervisor,
-      minIntervalMs: 1,
-      updateState: vi.fn(async () => {}),
-      recordFailure: vi.fn(async () => {}),
-      fireBatch,
-      logger: { info: vi.fn(), warn: vi.fn() },
-    });
+    const { fake, fireBatch, watchers } = createCronStreamWatcherFixture({ minIntervalMs: 1 });
     await watchers.reconcile(
       [
         job({
@@ -694,16 +490,7 @@ describe("cron stream output", () => {
 
   it("preserves leading and consecutive empty lines in a batch", async () => {
     vi.useFakeTimers();
-    const fake = fakeSupervisor();
-    const fireBatch = vi.fn(async () => "fired" as const);
-    const watchers = createWatchers({
-      getProcessSupervisor: () => fake.supervisor,
-      minIntervalMs: 1,
-      updateState: vi.fn(async () => {}),
-      recordFailure: vi.fn(async () => {}),
-      fireBatch,
-      logger: { info: vi.fn(), warn: vi.fn() },
-    });
+    const { fake, fireBatch, watchers } = createCronStreamWatcherFixture({ minIntervalMs: 1 });
     await watchers.reconcile([job()], true);
     await settle();
 
@@ -721,14 +508,9 @@ describe("cron stream output", () => {
 
   it("stops the source when a once trigger disables its job", async () => {
     vi.useFakeTimers();
-    const fake = fakeSupervisor();
-    const watchers = createWatchers({
-      getProcessSupervisor: () => fake.supervisor,
+    const { fake, watchers } = createCronStreamWatcherFixture({
       minIntervalMs: 1,
-      updateState: vi.fn(async () => {}),
-      recordFailure: vi.fn(async () => {}),
       fireBatch: vi.fn(async () => "disabled" as const),
-      logger: { info: vi.fn(), warn: vi.fn() },
     });
     await watchers.reconcile([job()], true);
     await settle();
@@ -744,16 +526,7 @@ describe("cron stream output", () => {
 
   it("keeps interleaved stdout and stderr partial lines independent", async () => {
     vi.useFakeTimers();
-    const fake = fakeSupervisor();
-    const fireBatch = vi.fn(async (_job: CronJob, _batch: string) => "fired" as const);
-    const watchers = createWatchers({
-      getProcessSupervisor: () => fake.supervisor,
-      minIntervalMs: 1,
-      updateState: vi.fn(async () => {}),
-      recordFailure: vi.fn(async () => {}),
-      fireBatch,
-      logger: { info: vi.fn(), warn: vi.fn() },
-    });
+    const { fake, fireBatch, watchers } = createCronStreamWatcherFixture({ minIntervalMs: 1 });
     await watchers.reconcile([job()], true);
     await settle();
 

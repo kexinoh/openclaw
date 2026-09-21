@@ -1,8 +1,8 @@
-// Matrix plugin module implements sdk behavior.
 import type { Room } from "matrix-js-sdk/lib/models/room.js";
+import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
 import { normalizeStringEntries, uniqueStrings } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { resolveMatrixRoomKeyBackupReadinessError } from "./backup-health.js";
-import { formatMatrixErrorMessage, isMatrixNotFoundError } from "./errors.js";
+import { isMatrixNotFoundError } from "./errors.js";
 import {
   listMatrixOwnDevices,
   resolveMatrixCrossSigningPublicationStatus,
@@ -99,16 +99,16 @@ export class MatrixClient extends MatrixClientVerification {
     let stagedKeyId: string | null;
     try {
       stagedKeyId = (await this.resolveDefaultSecretStorageKeyId(crypto)) ?? null;
-      this.recoveryKeyStore.stageEncodedRecoveryKey({
+      await this.recoveryKeyStore.stageEncodedRecoveryKey({
         encodedPrivateKey: trimmedRecoveryKey,
         keyId: stagedKeyId,
       });
     } catch (err) {
-      return await fail(formatMatrixErrorMessage(err));
+      return await fail(formatErrorMessage(err));
     }
 
     const storedRecoveryKeyMatches =
-      this.recoveryKeyStore.getRecoveryKeySummary()?.encodedPrivateKey?.trim() ===
+      (await this.recoveryKeyStore.getRecoveryKeySummary())?.encodedPrivateKey?.trim() ===
       trimmedRecoveryKey;
     if (backupUsableBeforeStagedRecovery && storedRecoveryKeyMatches) {
       const status = await this.getOwnDeviceVerificationStatus();
@@ -122,11 +122,11 @@ export class MatrixClient extends MatrixClientVerification {
       const recoveryKeyAccepted = backupUsable;
       if (!status.verified) {
         if (recoveryKeyAccepted) {
-          this.recoveryKeyStore.commitStagedRecoveryKey({
+          await this.recoveryKeyStore.commitStagedRecoveryKey({
             keyId: stagedKeyId,
           });
         } else {
-          this.recoveryKeyStore.discardStagedRecoveryKey();
+          await this.recoveryKeyStore.discardStagedRecoveryKey();
         }
         return {
           success: false,
@@ -139,7 +139,7 @@ export class MatrixClient extends MatrixClientVerification {
         };
       }
       if (backupError) {
-        this.recoveryKeyStore.discardStagedRecoveryKey();
+        await this.recoveryKeyStore.discardStagedRecoveryKey();
         return {
           success: false,
           recoveryKeyAccepted,
@@ -149,7 +149,7 @@ export class MatrixClient extends MatrixClientVerification {
           ...status,
         };
       }
-      this.recoveryKeyStore.commitStagedRecoveryKey({
+      await this.recoveryKeyStore.commitStagedRecoveryKey({
         keyId: stagedKeyId,
       });
       return {
@@ -203,11 +203,11 @@ export class MatrixClient extends MatrixClientVerification {
       const recoveryKeyAccepted = stagedRecoveryKeyValidated && (status.verified || backupUsable);
       if (!status.verified) {
         if (backupUsable && stagedRecoveryKeyValidated) {
-          this.recoveryKeyStore.commitStagedRecoveryKey({
+          await this.recoveryKeyStore.commitStagedRecoveryKey({
             keyId: stagedKeyId,
           });
         } else {
-          this.recoveryKeyStore.discardStagedRecoveryKey();
+          await this.recoveryKeyStore.discardStagedRecoveryKey();
         }
         const committedStatus = recoveryKeyAccepted
           ? await this.getOwnDeviceVerificationStatus()
@@ -223,7 +223,7 @@ export class MatrixClient extends MatrixClientVerification {
         };
       }
       if (backupError) {
-        this.recoveryKeyStore.discardStagedRecoveryKey();
+        await this.recoveryKeyStore.discardStagedRecoveryKey();
         return {
           success: false,
           recoveryKeyAccepted,
@@ -234,7 +234,7 @@ export class MatrixClient extends MatrixClientVerification {
         };
       }
       if (!stagedRecoveryKeyValidated) {
-        this.recoveryKeyStore.discardStagedRecoveryKey();
+        await this.recoveryKeyStore.discardStagedRecoveryKey();
         return {
           success: false,
           recoveryKeyAccepted: false,
@@ -246,7 +246,7 @@ export class MatrixClient extends MatrixClientVerification {
         };
       }
 
-      this.recoveryKeyStore.commitStagedRecoveryKey({
+      await this.recoveryKeyStore.commitStagedRecoveryKey({
         keyId: stagedKeyId,
       });
       const committedStatus = await this.getOwnDeviceVerificationStatus();
@@ -259,8 +259,8 @@ export class MatrixClient extends MatrixClientVerification {
         ...committedStatus,
       };
     } catch (err) {
-      this.recoveryKeyStore.discardStagedRecoveryKey();
-      return await fail(formatMatrixErrorMessage(err));
+      await this.recoveryKeyStore.discardStagedRecoveryKey();
+      return await fail(formatErrorMessage(err));
     }
   }
 
@@ -296,7 +296,7 @@ export class MatrixClient extends MatrixClientVerification {
     try {
       const rawRecoveryKey = params.recoveryKey?.trim();
       if (rawRecoveryKey) {
-        this.recoveryKeyStore.stageEncodedRecoveryKey({
+        await this.recoveryKeyStore.stageEncodedRecoveryKey({
           encodedPrivateKey: rawRecoveryKey,
           keyId: await this.resolveDefaultSecretStorageKeyId(crypto),
         });
@@ -309,17 +309,17 @@ export class MatrixClient extends MatrixClientVerification {
         requireServerBackup: true,
       });
       if (backupError) {
-        this.recoveryKeyStore.discardStagedRecoveryKey();
+        await this.recoveryKeyStore.discardStagedRecoveryKey();
         return await fail(backupError);
       }
       if (typeof crypto.restoreKeyBackup !== "function") {
-        this.recoveryKeyStore.discardStagedRecoveryKey();
+        await this.recoveryKeyStore.discardStagedRecoveryKey();
         return await fail("Matrix crypto backend does not support full key backup restore");
       }
 
       const restore = await crypto.restoreKeyBackup();
       if (rawRecoveryKey) {
-        this.recoveryKeyStore.commitStagedRecoveryKey({
+        await this.recoveryKeyStore.commitStagedRecoveryKey({
           keyId: await this.resolveDefaultSecretStorageKeyId(crypto),
         });
       }
@@ -334,8 +334,8 @@ export class MatrixClient extends MatrixClientVerification {
         backup: finalBackup,
       };
     } catch (err) {
-      this.recoveryKeyStore.discardStagedRecoveryKey();
-      return await fail(formatMatrixErrorMessage(err));
+      await this.recoveryKeyStore.discardStagedRecoveryKey();
+      return await fail(formatErrorMessage(err));
     }
   }
 
@@ -366,6 +366,7 @@ export class MatrixClient extends MatrixClientVerification {
       return await fail("Matrix crypto is not available (start client with encryption enabled)");
     }
 
+    await this.recoveryKeyStore.drainPendingPersistence();
     previousVersion = await this.resolveRoomKeyBackupVersion();
 
     // Probe backup-secret access directly before reset. This keeps the reset preflight
@@ -437,7 +438,7 @@ export class MatrixClient extends MatrixClientVerification {
         backup,
       };
     } catch (err) {
-      return await fail(formatMatrixErrorMessage(err));
+      return await fail(formatErrorMessage(err));
     }
   }
 
@@ -488,7 +489,7 @@ export class MatrixClient extends MatrixClientVerification {
 
       rawRecoveryKey = params?.recoveryKey?.trim();
       if (rawRecoveryKey) {
-        this.recoveryKeyStore.stageEncodedRecoveryKey({
+        await this.recoveryKeyStore.stageEncodedRecoveryKey({
           encodedPrivateKey: rawRecoveryKey,
           keyId: await this.resolveDefaultSecretStorageKeyId(crypto),
         });
@@ -509,8 +510,8 @@ export class MatrixClient extends MatrixClientVerification {
       );
       await this.ensureRoomKeyBackupEnabled(crypto);
     } catch (err) {
-      this.recoveryKeyStore.discardStagedRecoveryKey();
-      bootstrapError = formatMatrixErrorMessage(err);
+      await this.recoveryKeyStore.discardStagedRecoveryKey();
+      bootstrapError = formatErrorMessage(err);
     }
 
     const verification = await this.getOwnDeviceVerificationStatus();
@@ -529,13 +530,13 @@ export class MatrixClient extends MatrixClientVerification {
         : null;
     const success = verificationError === null && backupError === null;
     if (success) {
-      this.recoveryKeyStore.commitStagedRecoveryKey({
+      await this.recoveryKeyStore.commitStagedRecoveryKey({
         keyId: await this.resolveDefaultSecretStorageKeyId(
           this.client.getCrypto() as MatrixCryptoBootstrapApi | undefined,
         ),
       });
     } else {
-      this.recoveryKeyStore.discardStagedRecoveryKey();
+      await this.recoveryKeyStore.discardStagedRecoveryKey();
     }
     const error = success ? undefined : (backupError ?? verificationError ?? undefined);
     return {
@@ -610,8 +611,9 @@ export class MatrixClient extends MatrixClientVerification {
       emitter: this.emitter,
       emitMembershipForRoom: (room) => this.emitMembershipForRoom(room),
       getSelfUserId: () => this.client.getUserId() ?? this.selfUserId ?? "",
-      setCurrentSyncState: (state) => {
+      setCurrentSyncState: (state, error) => {
         this.currentSyncState = state;
+        this.currentSyncError = error;
       },
     });
   }

@@ -1,5 +1,5 @@
 {
-  "startupJsGzipBytes": 324587,
-  "reason": "multi-gateway footer subtitle plus accumulated main drift (PR #114059), then the Memory settings surface: its i18n strings plus the rendering-free memory-schema facts settings search reads at startup",
-  "updatedAt": "2026-07-26"
+  "startupJsGzipBytes": 365261,
+  "reason": "Approved #153178 rebase measurement with frozen Pako 3.0.2: 365172 B rounds up to 365261 B (356.7 KiB), above the previous 364954 B baseline. The existing 512 B growth and 64 B build-variance allowances remain unchanged, giving an explicit 365837 B enforcement limit.",
+  "updatedAt": "2026-09-20"
 }

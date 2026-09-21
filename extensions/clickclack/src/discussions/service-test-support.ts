@@ -1,6 +1,9 @@
 import { createPluginRuntimeMock } from "openclaw/plugin-sdk/channel-test-helpers";
 import type { OpenClawPluginGatewayEvents, PluginRuntime } from "openclaw/plugin-sdk/core";
-import type { PluginStateSyncKeyedStore } from "openclaw/plugin-sdk/plugin-state-runtime";
+import type {
+  PluginStateKeyedStore,
+  PluginStateSyncKeyedStore,
+} from "openclaw/plugin-sdk/plugin-state-runtime";
 import { vi } from "vitest";
 import type { ClickClackClient } from "../http-client.js";
 import type { ClickClackChannel, ClickClackMessage, CoreConfig } from "../types.js";
@@ -17,7 +20,7 @@ export const MANAGED_CONTRACT_FIELDS = {
   sidebar_section: "",
 };
 
-function createMemoryStore<T>(): PluginStateSyncKeyedStore<T> {
+export function createDiscussionMemoryStore<T>(): PluginStateSyncKeyedStore<T> {
   const values = new Map<string, { value: T; createdAt: number }>();
   return {
     register(key, value) {
@@ -44,6 +47,25 @@ function createMemoryStore<T>(): PluginStateSyncKeyedStore<T> {
         createdAt: entry.createdAt,
       })),
     clear: () => values.clear(),
+  };
+}
+
+export function asyncDiscussionTestStore<T>(
+  openStore: PluginRuntime["state"]["openSyncKeyedStore"],
+  options: Parameters<PluginRuntime["state"]["openKeyedStore"]>[0],
+): PluginStateKeyedStore<T> {
+  if (options.retention === "retained") {
+    throw new Error("ClickClack discussion fixture expects a bounded store");
+  }
+  const store = openStore<T>(options);
+  return {
+    register: async (...args) => store.register(...args),
+    registerIfAbsent: async (...args) => store.registerIfAbsent(...args),
+    lookup: async (...args) => store.lookup(...args),
+    consume: async (...args) => store.consume(...args),
+    delete: async (...args) => store.delete(...args),
+    entries: async () => store.entries(),
+    clear: async () => store.clear(),
   };
 }
 
@@ -81,25 +103,32 @@ export function createHarness(
     bindingGenerationFactory?: () => string;
     gatewayEvents?: Pick<OpenClawPluginGatewayEvents, "onSessionsChanged">;
     startTimer?: boolean;
+    maxRetainedDetachedBindings?: number;
+    openSyncKeyedStore?: PluginRuntime["state"]["openSyncKeyedStore"];
   } = {},
 ) {
   let sessionEntry = entry;
   const config = discussionConfig();
-  const store = createMemoryStore<unknown>();
-  const generationStore = createMemoryStore<unknown>();
-  const revokedStore = createMemoryStore<unknown>();
+  const store = createDiscussionMemoryStore<unknown>();
+  const generationStore = createDiscussionMemoryStore<unknown>();
+  const revokedStore = createDiscussionMemoryStore<unknown>();
+  const openSyncKeyedStore =
+    options.openSyncKeyedStore ??
+    (vi.fn((storeOptions: { namespace: string }) => {
+      if (storeOptions.namespace === "discussion-binding-generations") {
+        return generationStore;
+      }
+      if (storeOptions.namespace === "discussion-revoked-channels") {
+        return revokedStore;
+      }
+      return store;
+    }) as unknown as PluginRuntime["state"]["openSyncKeyedStore"]);
   const runtime = createPluginRuntimeMock({
     config: { current: vi.fn(() => config) },
     state: {
-      openSyncKeyedStore: vi.fn((storeOptions: { namespace: string }) => {
-        if (storeOptions.namespace === "discussion-binding-generations") {
-          return generationStore;
-        }
-        if (storeOptions.namespace === "discussion-revoked-channels") {
-          return revokedStore;
-        }
-        return store;
-      }) as unknown as PluginRuntime["state"]["openSyncKeyedStore"],
+      openSyncKeyedStore,
+      openKeyedStore: <T>(storeOptions: Parameters<PluginRuntime["state"]["openKeyedStore"]>[0]) =>
+        asyncDiscussionTestStore<T>(openSyncKeyedStore, storeOptions),
     },
     agent: {
       session: {
@@ -120,7 +149,10 @@ export function createHarness(
     }),
   );
   const updateChannel = vi.fn(
-    async (_channelId: string, patch: Parameters<ClickClackClient["updateChannel"]>[1]) => ({
+    async (
+      _channelId: string,
+      patch: Parameters<ClickClackClient["updateChannel"]>[1],
+    ): Promise<ClickClackChannel> => ({
       id: "chn_discussion",
       route_id: "discussion-route",
       workspace_id: "wsp_team",
@@ -131,7 +163,6 @@ export function createHarness(
       external_url: patch.external_url ?? "https://control.example/control/chat/main",
       sidebar_section: patch.sidebar_section ?? "Projects",
       ...(patch.display_title !== undefined ? { display_title: patch.display_title } : {}),
-      archived: patch.archived ?? false,
       created_at: "2026-07-19T00:00:00.000Z",
     }),
   );
@@ -172,6 +203,9 @@ export function createHarness(
     installationId: TEST_INSTALLATION_ID,
     bindingGenerationFactory: options.bindingGenerationFactory ?? (() => TEST_BINDING_GENERATION),
     startTimer: options.startTimer ?? false,
+    ...(options.maxRetainedDetachedBindings !== undefined
+      ? { maxRetainedDetachedBindings: options.maxRetainedDetachedBindings }
+      : {}),
     ...(options.gatewayEvents ? { gatewayEvents: options.gatewayEvents } : {}),
   });
   return {
@@ -192,11 +226,10 @@ export function createHarness(
   };
 }
 
-export function testExternalRef(sessionKey: string, sessionId = "session-id"): string {
+export function testExternalRef(sessionKey: string): string {
   return discussionExternalRef(
     TEST_INSTALLATION_ID,
     sessionKey,
-    sessionId,
     TEST_DESTINATION_IDENTITY,
     TEST_BINDING_GENERATION,
   );

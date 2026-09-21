@@ -9,7 +9,8 @@ import {
   stripLegacyMediaContextFields,
   type LegacyMediaContextKey,
 } from "../../media/media-facts.js";
-import { resolveCommandTurnContext } from "../command-turn-context.js";
+import { createCommandTurnContext, resolveCommandTurnContext } from "../command-turn-context.js";
+import { normalizeInternalTurnContext } from "../internal-turn-source.js";
 import type {
   CanonicalInboundText,
   FinalizedMsgContext,
@@ -22,7 +23,6 @@ export type FinalizeInboundContextOptions = {
   forceBodyForAgent?: boolean;
   forceBodyForCommands?: boolean;
   forceChatType?: boolean;
-  forceConversationLabel?: boolean;
 };
 
 const FINALIZED_INBOUND_CONTEXT = Symbol("openclaw.finalizedInboundContext");
@@ -41,15 +41,12 @@ export function isFinalizedInboundContext<T extends Record<string, unknown>>(
 }
 
 function resolveCanonicalInboundText(
-  ctx: Record<string, unknown>,
+  ctx: MsgContext & { BodyStripped?: unknown },
   opts: Pick<FinalizeInboundContextOptions, "forceBodyForAgent" | "forceBodyForCommands"> = {},
 ): CanonicalInboundText {
-  const body = normalizeTextField(ctx.Body) ?? "";
+  const body = ctx.Body ?? "";
   const rawTextFromAliases =
-    normalizeTextField(ctx.RawBody) ??
-    normalizeTextField(ctx.Transcript) ??
-    normalizeTextField(ctx.BodyStripped) ??
-    body;
+    ctx.RawBody ?? ctx.Transcript ?? normalizeTextField(ctx.BodyStripped) ?? body;
   const forceTextProjection = opts.forceBodyForAgent || opts.forceBodyForCommands;
   const rawText = forceTextProjection
     ? rawTextFromAliases
@@ -58,15 +55,21 @@ function resolveCanonicalInboundText(
     ? body
     : (normalizeTextField(ctx.agentText) ??
       normalizeTextField(ctx.BodyForAgent) ??
-      normalizeTextField(ctx.CommandBody) ??
+      ctx.CommandBody ??
       rawText);
   const commandText = opts.forceBodyForCommands
-    ? (normalizeTextField(ctx.CommandBody) ?? rawText)
+    ? (ctx.CommandBody ?? rawText)
     : (normalizeTextField(ctx.commandText) ??
       normalizeTextField(ctx.BodyForCommands) ??
-      normalizeTextField(ctx.CommandBody) ??
+      ctx.CommandBody ??
       rawText);
-  return { commandText, agentText, rawText };
+  // Literal input has no executable projection, including before command handlers
+  // run or when media enrichment forces text projection again.
+  return {
+    commandText: ctx.CommandInterpretationSuppressed === true ? "" : commandText,
+    agentText,
+    rawText,
+  };
 }
 
 function foldDeprecatedPromptContextFields(ctx: MsgContext): void {
@@ -125,6 +128,7 @@ function finalizeInboundContextImpl<T extends Record<string, unknown>>(
   preserveLegacyMedia: boolean,
 ): T & FinalizedMsgContext {
   const normalized = ctx as T & MsgContext;
+  normalizeInternalTurnContext(normalized);
   foldDeprecatedPromptContextFields(normalized);
   applySupplementalContext(normalized);
 
@@ -153,7 +157,7 @@ function finalizeInboundContextImpl<T extends Record<string, unknown>>(
   normalized.BodyForCommands = normalized.commandText;
 
   const explicitLabel = normalizeOptionalString(normalized.ConversationLabel);
-  if (opts.forceConversationLabel || !explicitLabel) {
+  if (!explicitLabel) {
     const resolved = normalizeOptionalString(resolveConversationLabel(normalized));
     if (resolved) {
       normalized.ConversationLabel = resolved;
@@ -163,8 +167,11 @@ function finalizeInboundContextImpl<T extends Record<string, unknown>>(
   }
 
   // Always set. Default-deny when upstream forgets to populate it.
-  normalized.CommandAuthorized = normalized.CommandAuthorized === true;
-  normalized.CommandTurn = resolveCommandTurnContext(normalized);
+  const suppressCommands = normalized.CommandInterpretationSuppressed === true;
+  normalized.CommandAuthorized = !suppressCommands && normalized.CommandAuthorized === true;
+  normalized.CommandTurn = suppressCommands
+    ? createCommandTurnContext("message", { authorized: false, body: "" })
+    : resolveCommandTurnContext(normalized);
   if (normalized.CommandTurn.source === "native" || normalized.CommandTurn.source === "text") {
     normalized.CommandSource = normalized.CommandTurn.source;
     normalized.CommandAuthorized = normalized.CommandTurn.authorized;

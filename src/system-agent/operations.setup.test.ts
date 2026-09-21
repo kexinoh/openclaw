@@ -1,20 +1,26 @@
 // OpenClaw operation tests cover rescue operation planning and execution.
 import fs from "node:fs/promises";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import { listAgentEntries } from "../agents/agent-scope-config.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { resetPluginStateStoreForTests } from "../plugin-state/plugin-state-store.js";
 import { captureEnv, setTestEnvValue } from "../test-utils/env.js";
 import { SystemAgentInferenceUnavailableError } from "./inference-error.js";
-import { executeSystemAgentOperation, type SystemAgentCommandDeps } from "./operations.js";
 import {
-  createSystemAgentTestRuntime,
+  executeSystemAgentOperation as executeSystemAgentOperationImpl,
+  type SystemAgentCommandDeps,
+} from "./operations.js";
+import { createSystemAgentTestRuntime } from "./system-agent.runtime.test-support.js";
+import {
   expectSystemAgentAuditRecord as expectAuditRecord,
   expectTestRecordFields as expectRecordFields,
+  installSystemAgentClaudeCliBackendTestFixture,
+  createSystemAgentPluginMetadataTestSnapshot,
   readLastSystemAgentAuditEntry as readLastAuditEntry,
   requireTestRecord as requireRecord,
+  type SystemAgentPluginMetadataTestSnapshot,
 } from "./system-agent.test-helpers.js";
 
 type TestConfig = Record<string, unknown>;
@@ -28,8 +34,10 @@ const mockConfig = vi.hoisted(() => {
     hash: "mock-hash-0" as string | undefined,
   };
   const cloneConfig = () => structuredClone(state.config);
+  let bindPluginMetadata = (_config: TestConfig) => {};
   const snapshot = () => {
     const config = cloneConfig();
+    bindPluginMetadata(config);
     return {
       path: state.path,
       exists: state.exists,
@@ -52,18 +60,24 @@ const mockConfig = vi.hoisted(() => {
       state.exists = true;
       state.config = { agents: { entries: { main: { default: true } } } };
       state.hash = "mock-hash-0";
+      bindPluginMetadata(state.config);
     },
     missing(pathLocal: string) {
       state.path = pathLocal;
       state.exists = false;
       state.config = { agents: { entries: { main: { default: true } } } };
       state.hash = undefined;
+      bindPluginMetadata(state.config);
     },
     currentConfig() {
       return cloneConfig();
     },
     setConfig(config: TestConfig) {
       state.config = structuredClone(config);
+      bindPluginMetadata(state.config);
+    },
+    setPluginMetadataBinder(binder: (config: TestConfig) => void) {
+      bindPluginMetadata = binder;
     },
     readConfigFileSnapshot: vi.fn(async () => snapshot()),
     mutateConfigFile: vi.fn(
@@ -79,10 +93,12 @@ const mockConfig = vi.hoisted(() => {
         const before = snapshot();
         const draft = cloneConfig();
         await params.mutate(draft, { snapshot: before });
+        bindPluginMetadata(draft);
         await params.writeOptions?.preCommitRuntimePreflight?.(structuredClone(draft));
         state.exists = true;
         state.config = draft;
         state.hash = "mock-hash-1";
+        bindPluginMetadata(state.config);
         return {
           path: state.path,
           previousHash: before.hash ?? null,
@@ -138,7 +154,34 @@ vi.mock("../config/config.js", () => ({
   mutateConfigFile: mockConfig.mutateConfigFile,
   readConfigFileSnapshot: mockConfig.readConfigFileSnapshot,
 }));
+
+vi.mock("../state/local-onboarding-state.js", () => ({
+  readLocalOnboardingState: () => undefined,
+  readLocalOnboardingStateForConfig: () => undefined,
+  completeLocalOnboarding: () => false,
+}));
+
 const opTempDirs = useAutoCleanupTempDirTracker(afterEach);
+let restoreCliBackendFixture: (() => void) | undefined;
+let pluginMetadataSnapshot: SystemAgentPluginMetadataTestSnapshot | undefined;
+
+const executeSystemAgentOperation: typeof executeSystemAgentOperationImpl = (...args) =>
+  pluginMetadataSnapshot!.run(() => executeSystemAgentOperationImpl(...args));
+
+beforeAll(() => {
+  restoreCliBackendFixture = installSystemAgentClaudeCliBackendTestFixture();
+  pluginMetadataSnapshot = createSystemAgentPluginMetadataTestSnapshot();
+  mockConfig.setPluginMetadataBinder((config) => {
+    pluginMetadataSnapshot?.bindForConfig(config as OpenClawConfig);
+  });
+  mockConfig.reset();
+});
+
+afterAll(() => {
+  mockConfig.setPluginMetadataBinder(() => {});
+
+  restoreCliBackendFixture?.();
+});
 
 describe("parseSystemAgentOperation", () => {
   let stateDirSnapshot: ReturnType<typeof captureEnv> | undefined;
@@ -155,83 +198,100 @@ describe("parseSystemAgentOperation", () => {
     vi.unstubAllEnvs();
   });
 
-  it("runs setup bootstrap only after approval and audits it", async () => {
-    const tempDir = opTempDirs.make("openclaw-setup-");
-    setTestEnvValue("OPENCLAW_STATE_DIR", tempDir);
-    const { runtime, lines } = createSystemAgentTestRuntime();
-    mockConfig.setConfig({
-      agents: {
-        defaults: { model: { primary: "openai/gpt-5.5" } },
-        entries: { main: { default: true } },
-      },
-    });
-    const applySetup = vi.fn(async () => ({
-      configPath: path.join(tempDir, "openclaw.json"),
-      configHashBefore: "mock-hash-0",
-      configHashAfter: "mock-hash-1",
-      bootstrapPending: true,
-      lines: ["Workspace: /tmp/work"],
-    }));
-    const deps = {
-      applySetup,
-      loadOverview: async () => ({ defaultModel: "openai/gpt-5.5" }) as never,
-      verifyInferenceConfig: vi.fn(async () => ({
-        ok: true as const,
-        modelRef: "openai/gpt-5.5",
-        latencyMs: 12,
-      })),
-    };
+  it.each(["default", "setup"] as const)(
+    "runs %s-model setup only after approval and audits it",
+    async (modelRole) => {
+      const tempDir = opTempDirs.make("openclaw-setup-");
+      setTestEnvValue("OPENCLAW_STATE_DIR", tempDir);
+      const { runtime, lines } = createSystemAgentTestRuntime();
+      mockConfig.setConfig({
+        meta: { migrations: { utilityModelSeparation: true } },
+        agents: {
+          defaults:
+            modelRole === "default"
+              ? { model: { primary: "openai/gpt-5.5" } }
+              : { utilityModel: "openai/gpt-5.5" },
+          entries: { main: { default: true } },
+        },
+      });
+      const applySetup = vi.fn(async () => ({
+        configPath: path.join(tempDir, "openclaw.json"),
+        configHashBefore: "mock-hash-0",
+        configHashAfter: "mock-hash-1",
+        bootstrapPending: true,
+        workspaceReady: true,
+        gateway: { status: "ready" as const, action: "reused" as const },
+        lines: ["Workspace: /tmp/work"],
+      }));
+      const deps = {
+        applySetup,
+        loadOverview: async () =>
+          (modelRole === "default"
+            ? { defaultModel: "openai/gpt-5.5" }
+            : { setupModel: "openai/gpt-5.5" }) as never,
+        verifyInferenceConfig: vi.fn(async () => ({
+          ok: true as const,
+          modelRef: "openai/gpt-5.5",
+          latencyMs: 12,
+        })),
+      };
 
-    const plan = await executeSystemAgentOperation(
-      { kind: "setup", workspace: "/tmp/work" },
-      runtime,
-      { deps },
-    );
-    expectRecordFields(plan as unknown as Record<string, unknown>, {
-      applied: false,
-    });
-    expect(lines.join("\n")).toContain("Model choice: keep verified default openai/gpt-5.5.");
-    expect(applySetup).not.toHaveBeenCalled();
-
-    const result = await executeSystemAgentOperation(
-      { kind: "setup", workspace: "/tmp/work" },
-      runtime,
-      {
-        approved: true,
-        auditDetails: { rescue: true },
-        deps,
-      },
-    );
-    expect(result.applied).toBe(true);
-    expect(result.bootstrapPending).toBe(true);
-
-    expect(lines.join("\n")).toContain("[openclaw] done: openclaw.setup");
-    expect(applySetup).toHaveBeenCalledWith(
-      {
-        workspace: "/tmp/work",
-        expectedInferenceRoute: expect.any(Object),
-        surface: "cli",
+      const plan = await executeSystemAgentOperation(
+        { kind: "setup", workspace: "/tmp/work" },
         runtime,
-      },
-      { commit: expect.any(Function) },
-    );
-    expect(lines.join("\n")).toContain("Default model: openai/gpt-5.5 (verified and kept)");
-    const audit = readLastAuditEntry();
-    expectAuditRecord(
-      audit,
-      {
-        operation: "openclaw.setup",
-        summary: "Bootstrapped setup workspace",
-      },
-      {
-        rescue: true,
-        workspace: "/tmp/work",
-        model: "openai/gpt-5.5",
-        modelSource: "live-verified default model",
-        inferenceLatencyMs: 12,
-      },
-    );
-  });
+        { deps },
+      );
+      expectRecordFields(plan as unknown as Record<string, unknown>, {
+        applied: false,
+      });
+      expect(lines.join("\n")).toContain(
+        `Model choice: keep verified ${modelRole} openai/gpt-5.5.`,
+      );
+      expect(applySetup).not.toHaveBeenCalled();
+
+      const result = await executeSystemAgentOperation(
+        { kind: "setup", workspace: "/tmp/work", agentName: "robby" },
+        runtime,
+        {
+          approved: true,
+          auditDetails: { rescue: true },
+          deps,
+        },
+      );
+      expect(result.applied).toBe(true);
+      expect(result.bootstrapPending).toBe(true);
+
+      expect(lines.join("\n")).toContain("[openclaw] done: openclaw.setup");
+      expect(applySetup).toHaveBeenCalledWith(
+        {
+          workspace: "/tmp/work",
+          firstAgent: { name: "robby" },
+          expectedInferenceRoute: expect.any(Object),
+          surface: "cli",
+          runtime,
+        },
+        { beforePersistentApply: undefined },
+      );
+      expect(lines.join("\n")).toContain(
+        `${modelRole === "default" ? "Default" : "Setup"} model: openai/gpt-5.5 (verified and kept)`,
+      );
+      const audit = readLastAuditEntry();
+      expectAuditRecord(
+        audit,
+        {
+          operation: "openclaw.setup",
+          summary: "Bootstrapped setup workspace",
+        },
+        {
+          rescue: true,
+          workspace: "/tmp/work",
+          model: "openai/gpt-5.5",
+          modelSource: `live-verified ${modelRole} model`,
+          inferenceLatencyMs: 12,
+        },
+      );
+    },
+  );
 
   it("rejects setup without a default model before any workspace or Gateway write", async () => {
     const tempDir = opTempDirs.make("openclaw-no-inference-setup-");
@@ -339,6 +399,8 @@ describe("parseSystemAgentOperation", () => {
       configHashBefore: "mock-hash-0",
       configHashAfter: "mock-hash-1",
       bootstrapPending: false,
+      workspaceReady: true,
+      gateway: { status: "ready" as const, action: "reused" as const },
       lines: [],
     }));
 
@@ -368,7 +430,7 @@ describe("parseSystemAgentOperation", () => {
     expect(mockConfig.currentConfig()).toMatchObject({ gateway: { port: 19000 } });
     expect(applySetup).toHaveBeenCalledWith(
       expect.objectContaining({ expectedInferenceRoute: expect.any(Object) }),
-      { commit: expect.any(Function) },
+      { beforePersistentApply: undefined },
     );
   });
 
@@ -390,7 +452,7 @@ describe("parseSystemAgentOperation", () => {
           },
         },
       ),
-    ).rejects.toThrow("Exit OpenClaw and run `openclaw onboard`");
+    ).rejects.toThrow("`openclaw onboard` on the machine running OpenClaw");
 
     expect(applySetup).not.toHaveBeenCalled();
   });
@@ -410,6 +472,8 @@ describe("parseSystemAgentOperation", () => {
       configHashBefore: "mock-hash-0",
       configHashAfter: "mock-hash-1",
       bootstrapPending: false,
+      workspaceReady: true,
+      gateway: { status: "ready" as const, action: "reused" as const },
       lines: ["Workspace: /tmp/work"],
     }));
 
@@ -438,7 +502,7 @@ describe("parseSystemAgentOperation", () => {
         surface: "cli",
         runtime,
       },
-      { commit: expect.any(Function) },
+      { beforePersistentApply: undefined },
     );
   });
 
@@ -449,6 +513,7 @@ describe("parseSystemAgentOperation", () => {
       agents: {
         defaults: {
           model: { primary: "anthropic/claude-sonnet-4-6", fallbacks: ["openai/gpt-5.2"] },
+          systemAgent: { agentId: "main" },
         },
         entries: { main: { default: true, workspace: "/tmp/main" } },
       },
@@ -516,7 +581,7 @@ describe("parseSystemAgentOperation", () => {
           channels: { telegram: { enabled: true } },
         });
       } else {
-        onVerifiedExecution?.({} as never, reboundBinding);
+        onVerifiedExecution?.(reboundBinding);
       }
       return { ok: true as const, modelRef: "openai/gpt-5.5", latencyMs: 17 };
     });
@@ -555,6 +620,9 @@ describe("parseSystemAgentOperation", () => {
     expect(
       requireRecord(requireRecord(persisted.agents, "agents").defaults, "defaults").model,
     ).toEqual({ primary: "openai/gpt-5.5", fallbacks: ["openai/gpt-5.2"] });
+    expect(
+      requireRecord(requireRecord(persisted.agents, "agents").defaults, "defaults").systemAgent,
+    ).toEqual({ agentId: "main" });
     expect(requireRecord(persisted.agents, "agents").entries).toEqual({
       main: { default: true, workspace: "/tmp/main" },
       work: { workspace: "/tmp/work" },
@@ -595,18 +663,20 @@ describe("parseSystemAgentOperation", () => {
 
   it.each([
     {
-      field: "default agent",
+      field: "system agent",
       initial: {
         agents: {
-          defaults: { model: { primary: "anthropic/claude-sonnet-4-6" } },
+          defaults: {
+            model: { primary: "anthropic/claude-sonnet-4-6" },
+            systemAgent: { agentId: "main" },
+          },
           entries: { main: { default: true }, work: {} },
         },
       },
       change: (config: TestConfig) => {
         const next = structuredClone(config);
-        const entries = requireRecord(requireRecord(next.agents, "agents").entries, "entries");
-        delete requireRecord(entries.main, "main").default;
-        requireRecord(entries.work, "work").default = true;
+        const defaults = requireRecord(requireRecord(next.agents, "agents").defaults, "defaults");
+        defaults.systemAgent = { agentId: "work" };
         return next;
       },
     },
@@ -880,7 +950,7 @@ describe("parseSystemAgentOperation", () => {
         latencyMs: 5,
       };
     });
-    const beforePersistentApply = vi.fn(async () => {
+    const beforePersistentApply = vi.fn(() => {
       if (bindingOwner !== "verified") {
         throw new SystemAgentInferenceUnavailableError("conversation");
       }
@@ -926,7 +996,7 @@ describe("parseSystemAgentOperation", () => {
         latencyMs: 5,
       };
     });
-    const beforePersistentApply = vi.fn(async () => {
+    const beforePersistentApply = vi.fn(() => {
       if (bindingOwner !== "verified") {
         throw new SystemAgentInferenceUnavailableError("conversation");
       }

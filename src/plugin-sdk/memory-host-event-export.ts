@@ -1,6 +1,8 @@
 import type { FileHandle } from "node:fs/promises";
 import path from "node:path";
 import { syncDirectoryIfSupported } from "../infra/directory-durability.js";
+import { isMissingPathError } from "../infra/errors.js";
+import { writeFileWindowFully } from "../infra/file-descriptor.js";
 import { sameFileIdentity, type FileIdentityStat } from "../infra/fs-safe-advanced.js";
 import { FsSafeError, root as createFsSafeRoot } from "../infra/fs-safe.js";
 
@@ -14,15 +16,6 @@ export type MemoryHostEventExportOwner = {
 };
 
 type MemoryHostWorkspaceRoot = Awaited<ReturnType<typeof createFsSafeRoot>>;
-
-export function isMissingPathError(error: unknown): boolean {
-  const code = (error as { code?: unknown }).code;
-  return (
-    code === "ENOENT" ||
-    code === "ENOTDIR" ||
-    (error instanceof FsSafeError && code === "not-found")
-  );
-}
 
 export function isRejectedWorkspaceArtifactPath(error: unknown): boolean {
   if (!(error instanceof FsSafeError)) {
@@ -64,14 +57,7 @@ async function writePinnedMemoryHostEventArtifact(
   content: string,
 ): Promise<void> {
   const bytes = Buffer.from(content, "utf8");
-  let offset = 0;
-  while (offset < bytes.length) {
-    const result = await handle.write(bytes, offset, bytes.length - offset, offset);
-    if (result.bytesWritten === 0) {
-      throw new Error("event export write made no progress");
-    }
-    offset += result.bytesWritten;
-  }
+  await writeFileWindowFully(handle, bytes, 0);
   await handle.truncate(bytes.length);
   await handle.chmod(0o600);
   await handle.sync();

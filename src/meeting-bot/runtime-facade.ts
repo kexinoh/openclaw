@@ -129,6 +129,7 @@ export function createMeetingRuntimeFacade<
         speakViaTransport: async () => undefined,
         durableTranscripts: {
           config: params.fullConfig.transcripts,
+          openclawConfig: params.fullConfig,
           ...options.messages.durableTranscripts,
         },
       });
@@ -273,7 +274,7 @@ export function createMeetingRuntimeFacade<
         tab: result.tab,
       });
       session.chrome = {
-        audioBackend: "blackhole-2ch",
+        audioBackend: result.audioBackend,
         launched: result.launched,
         nodeId,
         browserProfile: this.params.config.chrome.browserProfile,

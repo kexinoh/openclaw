@@ -1,29 +1,29 @@
-// Qa Lab plugin module implements slack desktop smoke behavior.
-import { randomUUID } from "node:crypto";
-import fs from "node:fs/promises";
 import path from "node:path";
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
-import { pathExists, root } from "openclaw/plugin-sdk/security-runtime";
 import { ensureRepoBoundDirectory, resolveRepoRelativeOutputDir } from "../cli-paths.js";
+import { toQaError } from "../errors.js";
 import {
   acquireQaCredentialLease,
   startQaCredentialLeaseHeartbeat,
 } from "../live-transports/shared/credential-lease.runtime.js";
-import { resolveSlackQaScenarioIds } from "../live-transports/slack/scenario-selection.js";
+import { resolveLiveTransportQaScenarioIds } from "../live-transports/shared/scenario-selection.js";
 import { isTruthyOptIn, trimToValue } from "../mantis-options.runtime.js";
 import { createPhaseTimer, type MantisPhaseTimings } from "../mantis-phase-timer.runtime.js";
 import {
+  copyCrabboxArtifacts,
   type CommandRunner,
-  type CrabboxInspect,
   defaultCommandRunner,
-  inspectCrabbox,
+  createMantisCrabboxSession,
   resolveCrabboxBin,
   runCommand,
   shellQuote,
-  sshCommand,
-  stopCrabbox,
-  warmupCrabbox,
 } from "./crabbox-runtime.js";
+import { renderMantisCrabboxReport, type MantisCrabboxReportSummary } from "./report.js";
+import {
+  createSlackDesktopArtifactOwner,
+  type MantisApprovalCheckpointArtifacts,
+  type SlackDesktopRemoteMetadata,
+} from "./slack-desktop-smoke.artifacts.js";
 
 export type MantisSlackDesktopSmokeOptions = {
   alternateModel?: string;
@@ -54,7 +54,7 @@ export type MantisSlackDesktopSmokeOptions = {
   ttl?: string;
 };
 
-export type MantisSlackDesktopHydrateMode = "prehydrated" | "source";
+type MantisSlackDesktopHydrateMode = "prehydrated" | "source";
 
 type MantisSlackDesktopSmokeResult = {
   approvalCheckpointScreenshotPaths?: string[];
@@ -77,63 +77,16 @@ type SlackGatewayCredentialLease = Awaited<
 >;
 type SlackGatewayCredentialHeartbeat = ReturnType<typeof startQaCredentialLeaseHeartbeat>;
 
-type MantisSlackDesktopSmokeSummary = {
-  artifacts: {
+type MantisSlackDesktopSmokeSummary = MantisCrabboxReportSummary & {
+  artifacts: MantisCrabboxReportSummary["artifacts"] & {
     approvalCheckpoints?: MantisApprovalCheckpointArtifacts;
-    reportPath: string;
-    screenshotPath?: string;
     slackQaDir?: string;
-    summaryPath: string;
-    videoPath?: string;
   };
-  crabbox: {
-    bin: string;
-    createdLease: boolean;
-    id: string;
-    provider: string;
-    slug?: string;
-    state?: string;
-    vncCommand: string;
-  };
-  error?: string;
-  finishedAt: string;
   hydrateMode: MantisSlackDesktopHydrateMode;
-  outputDir: string;
   remoteOutputDir: string;
   slackUrl?: string;
-  startedAt: string;
-  status: "pass" | "fail";
   timings: MantisPhaseTimings;
   warning?: string;
-};
-
-type SlackDesktopRemoteMetadata = {
-  gatewayAlive?: boolean;
-  gatewayPid?: string;
-  hydrateMode?: string;
-  openedUrl?: string;
-  qaExitCode?: number;
-};
-
-type MantisApprovalCheckpointState = "pending" | "resolved";
-type SlackArtifactOwner = Awaited<ReturnType<typeof root>>;
-type MantisApprovalCheckpointIdentity = {
-  approvalId: string;
-  messageTs: string;
-  threadTs: string | null;
-};
-
-type MantisApprovalCheckpointScreenshot = {
-  ackPath: string;
-  checkpointPath: string;
-  scenarioId: string;
-  screenshotPath: string;
-  state: MantisApprovalCheckpointState;
-};
-
-type MantisApprovalCheckpointArtifacts = {
-  directoryPath: string;
-  screenshots: MantisApprovalCheckpointScreenshot[];
 };
 
 const DEFAULT_PROVIDER = "hetzner";
@@ -223,282 +176,16 @@ function resolveScenarioIds(params: {
     }
     // Mirror the YAML catalog order used by the Slack runner so the watcher
     // and runner cannot block on different approval checkpoints.
-    return resolveSlackQaScenarioIds({ scenarioIds });
+    return resolveLiveTransportQaScenarioIds({
+      channelId: "slack",
+      providerMode: "live-frontier",
+      scenarioIds,
+      supportsModuleFlows: true,
+    });
   }
   return scenarioIds;
 }
 
-async function assertNonEmptyFile(owner: SlackArtifactOwner, relativePath: string, label: string) {
-  let opened;
-  try {
-    opened = await owner.open(relativePath);
-  } catch (error) {
-    throw new Error(`${label} is missing: ${relativePath}`, { cause: error });
-  }
-  try {
-    if (opened.stat.size <= 0) {
-      throw new Error(`${label} is empty: ${relativePath}`);
-    }
-  } finally {
-    await opened.handle.close();
-  }
-}
-
-async function readJsonObject(
-  owner: SlackArtifactOwner,
-  relativePath: string,
-  label: string,
-): Promise<Record<string, unknown>> {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(await owner.readText(relativePath));
-  } catch (error) {
-    throw new Error(`${label} is not valid JSON: ${relativePath}`, { cause: error });
-  }
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new Error(`${label} must be a JSON object: ${relativePath}`);
-  }
-  return parsed as Record<string, unknown>;
-}
-
-async function clearSlackArtifacts(owner: SlackArtifactOwner, artifactPaths: readonly string[]) {
-  await Promise.all(
-    [...new Set(artifactPaths)].map(async (artifactPath) => {
-      if (await owner.exists(artifactPath)) {
-        await owner.remove(artifactPath);
-      }
-    }),
-  );
-}
-
-async function finalizeSlackRunActions(actions: readonly (() => Promise<void>)[]) {
-  let firstFailure: unknown;
-  for (const action of actions) {
-    try {
-      await action();
-    } catch (error) {
-      firstFailure ??= error;
-    }
-  }
-  if (firstFailure !== undefined) {
-    throw firstFailure;
-  }
-}
-
-function assertApprovalCheckpointBaseJson(params: {
-  filePath: string;
-  label: string;
-  record: Record<string, unknown>;
-  scenarioId: string;
-  state: MantisApprovalCheckpointState;
-}) {
-  if (params.record.version !== 1) {
-    throw new Error(`${params.label} has unexpected version in ${params.filePath}`);
-  }
-  if (params.record.scenarioId !== params.scenarioId) {
-    throw new Error(`${params.label} has unexpected scenarioId in ${params.filePath}`);
-  }
-  if (params.record.state !== params.state) {
-    throw new Error(`${params.label} has unexpected state in ${params.filePath}`);
-  }
-}
-
-function assertApprovalCheckpointJson(params: {
-  channelId: string;
-  filePath: string;
-  identity?: MantisApprovalCheckpointIdentity;
-  label: string;
-  record: Record<string, unknown>;
-  scenarioId: string;
-  state: MantisApprovalCheckpointState;
-}): MantisApprovalCheckpointIdentity {
-  assertApprovalCheckpointBaseJson(params);
-  const expectedKind = params.scenarioId === "slack-approval-exec-native" ? "exec" : "plugin";
-  if (params.record.approvalKind !== expectedKind || params.record.channelId !== params.channelId) {
-    throw new Error(`${params.label} has unexpected approval kind or Slack channel.`);
-  }
-  const approvalId = params.record.approvalId;
-  const messageTs = params.record.messageTs;
-  const threadTs = params.record.threadTs;
-  if (
-    typeof approvalId !== "string" ||
-    !approvalId.trim() ||
-    typeof messageTs !== "string" ||
-    !messageTs.trim() ||
-    (threadTs !== null && (typeof threadTs !== "string" || !threadTs.trim()))
-  ) {
-    throw new Error(`${params.label} is missing its Slack approval interaction identity.`);
-  }
-  const identity = { approvalId, messageTs, threadTs };
-  if (
-    params.identity &&
-    (identity.approvalId !== params.identity.approvalId ||
-      identity.messageTs !== params.identity.messageTs ||
-      identity.threadTs !== params.identity.threadTs)
-  ) {
-    throw new Error(`${params.label} does not match its pending approval interaction.`);
-  }
-  if (params.record.decision !== (params.state === "pending" ? null : "allow-once")) {
-    throw new Error(`${params.label} has an unexpected approval decision.`);
-  }
-  const message = params.record.message;
-  if (!message || typeof message !== "object" || Array.isArray(message)) {
-    throw new Error(`${params.label} is missing Slack message evidence in ${params.filePath}`);
-  }
-  const candidate = message as Record<string, unknown>;
-  if (typeof candidate.text !== "string") {
-    throw new Error(`${params.label} message evidence is missing text in ${params.filePath}`);
-  }
-  if (
-    !Array.isArray(candidate.blockText) ||
-    !candidate.blockText.every((entry) => typeof entry === "string")
-  ) {
-    throw new Error(`${params.label} message evidence is missing blockText in ${params.filePath}`);
-  }
-  if (
-    !Array.isArray(candidate.actionLabels) ||
-    !candidate.actionLabels.every((entry) => typeof entry === "string")
-  ) {
-    throw new Error(
-      `${params.label} message evidence is missing actionLabels in ${params.filePath}`,
-    );
-  }
-  if (typeof candidate.hasNativeActions !== "boolean") {
-    throw new Error(
-      `${params.label} message evidence is missing hasNativeActions in ${params.filePath}`,
-    );
-  }
-  if (
-    (params.state === "pending" &&
-      (!candidate.hasNativeActions || !candidate.actionLabels.includes("Allow Once"))) ||
-    (params.state === "resolved" &&
-      (candidate.hasNativeActions || candidate.actionLabels.length > 0))
-  ) {
-    throw new Error(`${params.label} has unexpected native approval actions in ${params.filePath}`);
-  }
-  return identity;
-}
-
-function assertApprovalCheckpointAckJson(params: {
-  filePath: string;
-  label: string;
-  record: Record<string, unknown>;
-  scenarioId: string;
-  screenshotPath: string;
-  state: MantisApprovalCheckpointState;
-}) {
-  assertApprovalCheckpointBaseJson(params);
-  if (typeof params.record.screenshotPath !== "string" || !params.record.screenshotPath.trim()) {
-    throw new Error(`${params.label} is missing screenshotPath in ${params.filePath}`);
-  }
-  if (path.basename(params.record.screenshotPath) !== path.basename(params.screenshotPath)) {
-    throw new Error(`${params.label} screenshotPath does not match ${params.screenshotPath}`);
-  }
-}
-
-async function collectApprovalCheckpointArtifacts(params: {
-  artifactOwner: SlackArtifactOwner;
-  channelId: string;
-  enabled: boolean;
-  outputDir: string;
-  scenarioIds: readonly string[];
-}): Promise<MantisApprovalCheckpointArtifacts | undefined> {
-  if (!params.enabled) {
-    return undefined;
-  }
-  const directoryPath = path.join(params.outputDir, "approval-checkpoints");
-  const seenApprovalIds = new Set<string>();
-  const seenSlackMessages = new Set<string>();
-  const screenshots: MantisApprovalCheckpointScreenshot[] = [];
-  for (const scenarioId of params.scenarioIds) {
-    let identity: MantisApprovalCheckpointIdentity | undefined;
-    for (const state of ["pending", "resolved"] as const) {
-      const checkpointPath = path.join(directoryPath, `${scenarioId}.${state}.json`);
-      const ackPath = path.join(directoryPath, `${scenarioId}.${state}.ack.json`);
-      const screenshotPath = path.join(directoryPath, `${scenarioId}-${state}.png`);
-      const checkpointLabel = `Approval checkpoint ${scenarioId}.${state}`;
-      const ackLabel = `Approval checkpoint ack ${scenarioId}.${state}`;
-      identity = assertApprovalCheckpointJson({
-        channelId: params.channelId,
-        filePath: checkpointPath,
-        identity,
-        label: checkpointLabel,
-        record: await readJsonObject(
-          params.artifactOwner,
-          path.relative(params.outputDir, checkpointPath),
-          checkpointLabel,
-        ),
-        scenarioId,
-        state,
-      });
-      if (state === "pending") {
-        const slackMessage = JSON.stringify([
-          params.channelId,
-          identity.messageTs,
-          identity.threadTs,
-        ]);
-        if (seenApprovalIds.has(identity.approvalId) || seenSlackMessages.has(slackMessage)) {
-          throw new Error(`${checkpointLabel} reuses another scenario's approval interaction.`);
-        }
-        seenApprovalIds.add(identity.approvalId);
-        seenSlackMessages.add(slackMessage);
-      }
-      assertApprovalCheckpointAckJson({
-        filePath: ackPath,
-        label: ackLabel,
-        record: await readJsonObject(
-          params.artifactOwner,
-          path.relative(params.outputDir, ackPath),
-          ackLabel,
-        ),
-        scenarioId,
-        screenshotPath,
-        state,
-      });
-      await assertNonEmptyFile(
-        params.artifactOwner,
-        path.relative(params.outputDir, screenshotPath),
-        `Approval checkpoint screenshot ${scenarioId}.${state}`,
-      );
-      screenshots.push({
-        ackPath,
-        checkpointPath,
-        scenarioId,
-        screenshotPath,
-        state,
-      });
-    }
-  }
-  return {
-    directoryPath,
-    screenshots,
-  };
-}
-
-async function readRemoteMetadata(
-  owner: SlackArtifactOwner,
-): Promise<SlackDesktopRemoteMetadata | undefined> {
-  if (!(await owner.exists("remote-metadata.json"))) {
-    return undefined;
-  }
-  try {
-    const parsed = JSON.parse(await owner.readText("remote-metadata.json")) as unknown;
-    if (!parsed || typeof parsed !== "object") {
-      return undefined;
-    }
-    const candidate = parsed as Record<string, unknown>;
-    return {
-      gatewayAlive:
-        typeof candidate.gatewayAlive === "boolean" ? candidate.gatewayAlive : undefined,
-      gatewayPid: typeof candidate.gatewayPid === "string" ? candidate.gatewayPid : undefined,
-      hydrateMode: typeof candidate.hydrateMode === "string" ? candidate.hydrateMode : undefined,
-      openedUrl: typeof candidate.openedUrl === "string" ? candidate.openedUrl : undefined,
-      qaExitCode: typeof candidate.qaExitCode === "number" ? candidate.qaExitCode : undefined,
-    };
-  } catch {
-    return undefined;
-  }
-}
 function buildCrabboxEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const next = {
     ...env,
@@ -850,8 +537,9 @@ console.log(match[1] + " " + match[2]);
   active_pnpm_version="$(pnpm --version 2>/dev/null || true)"
   if [ "$active_pnpm_version" != "$pnpm_version" ]; then
     # Some desktop images ship an old distro Corepack that enables its shim but
-    # cannot execute current pnpm and may omit npm. Download the exact package,
-    # verify the repository-pinned digest, and run its bundled CLI with Node.
+    # cannot execute current pnpm and may omit npm. Verify the pinned wrapper;
+    # its Corepack entry verifies and downloads the
+    # native payload on first use, even on images without npm or Corepack.
     pnpm_root="$out/pnpm-$pnpm_version"
     pnpm_archive="$pnpm_root/pnpm.tgz"
     mkdir -p "$pnpm_root"
@@ -866,7 +554,7 @@ console.log(match[1] + " " + match[2]);
       exit 3
     fi
     tar -xzf "$pnpm_archive" -C "$pnpm_root"
-    pnpm_cli="$pnpm_root/package/bin/pnpm.cjs"
+    pnpm_cli="$pnpm_root/package/bin/pnpm.mjs"
     chmod +x "$pnpm_cli"
     pnpm_bin_dir="$pnpm_root/bin"
     mkdir -p "$pnpm_bin_dir"
@@ -1282,95 +970,38 @@ exit 0
 }
 
 function renderReport(summary: MantisSlackDesktopSmokeSummary) {
-  const lines = [
-    "# Mantis Slack Desktop Smoke",
-    "",
-    `Status: ${summary.status}`,
-    summary.slackUrl ? `Slack URL: ${summary.slackUrl}` : undefined,
-    `Output: ${summary.outputDir}`,
-    `Started: ${summary.startedAt}`,
-    `Finished: ${summary.finishedAt}`,
-    "",
-    "## Crabbox",
-    "",
-    `- Provider: ${summary.crabbox.provider}`,
-    `- Lease: ${summary.crabbox.id}${summary.crabbox.slug ? ` (${summary.crabbox.slug})` : ""}`,
-    `- Created by run: ${summary.crabbox.createdLease}`,
-    `- State: ${summary.crabbox.state ?? "unknown"}`,
-    `- VNC: \`${summary.crabbox.vncCommand}\``,
-    `- Hydrate mode: ${summary.hydrateMode}`,
-    "",
-    "## Timings",
-    "",
-    `- Total: ${Math.round(summary.timings.totalMs / 100) / 10}s`,
-    ...summary.timings.phases.map(
-      (phase) => `- ${phase.name}: ${Math.round(phase.durationMs / 100) / 10}s (${phase.status})`,
-    ),
-    "",
-    "## Artifacts",
-    "",
-    summary.artifacts.screenshotPath
-      ? `- Screenshot: \`${path.basename(summary.artifacts.screenshotPath)}\``
-      : "- Screenshot: missing",
-    summary.artifacts.videoPath
-      ? `- Video: \`${path.basename(summary.artifacts.videoPath)}\``
-      : "- Video: missing",
-    summary.artifacts.slackQaDir ? "- Slack QA artifacts: `slack-qa/`" : undefined,
-    summary.artifacts.approvalCheckpoints
-      ? "- Approval checkpoints: `approval-checkpoints/`"
-      : undefined,
-    ...(summary.artifacts.approvalCheckpoints?.screenshots.map(
-      (screenshot) =>
-        `- Approval checkpoint ${screenshot.scenarioId} ${screenshot.state}: \`approval-checkpoints/${path.basename(
-          screenshot.screenshotPath,
-        )}\``,
-    ) ?? []),
-    "- Remote metadata: `remote-metadata.json`",
-    "- Remote command log: `slack-desktop-command.log`",
-    "- FFmpeg log: `ffmpeg.log`",
-    "- Chrome log: `chrome.log`",
-    summary.error ? `- Error: ${summary.error}` : undefined,
-    "",
-  ].filter((line) => line !== undefined);
-  return `${lines.join("\n")}\n`;
-}
-
-async function copyRemoteArtifacts(params: {
-  cwd: string;
-  env: NodeJS.ProcessEnv;
-  inspect: CrabboxInspect;
-  outputDir: string;
-  remoteOutputDir: string;
-  runner: CommandRunner;
-}) {
-  const { host, sshArgs, sshUser } = sshCommand({ inspect: params.inspect });
-  await fs.mkdir(path.join(params.outputDir, "slack-qa"), { recursive: true });
-  await runCommand({
-    command: "rsync",
-    args: [
-      "-az",
-      "-e",
-      sshArgs,
-      `${sshUser}@${host}:${params.remoteOutputDir}/`,
-      `${params.outputDir}/`,
+  return renderMantisCrabboxReport({
+    artifactRows: [
+      summary.artifacts.slackQaDir ? "- Slack QA artifacts: `slack-qa/`" : undefined,
+      summary.artifacts.approvalCheckpoints
+        ? "- Approval checkpoints: `approval-checkpoints/`"
+        : undefined,
+      ...(summary.artifacts.approvalCheckpoints?.screenshots.map(
+        (screenshot) =>
+          `- Approval checkpoint ${screenshot.scenarioId} ${screenshot.state}: \`approval-checkpoints/${path.basename(
+            screenshot.screenshotPath,
+          )}\``,
+      ) ?? []),
+      "- Remote metadata: `remote-metadata.json`",
+      "- Remote command log: `slack-desktop-command.log`",
+      "- FFmpeg log: `ffmpeg.log`",
+      "- Chrome log: `chrome.log`",
+      summary.error ? `- Error: ${summary.error}` : undefined,
     ],
-    cwd: params.cwd,
-    env: params.env,
-    runner: params.runner,
+    beforeArtifacts: [
+      "## Timings",
+      "",
+      `- Total: ${Math.round(summary.timings.totalMs / 100) / 10}s`,
+      ...summary.timings.phases.map(
+        (phase) => `- ${phase.name}: ${Math.round(phase.durationMs / 100) / 10}s (${phase.status})`,
+      ),
+      "",
+    ],
+    crabboxRows: [`- Hydrate mode: ${summary.hydrateMode}`],
+    headerRows: [summary.slackUrl ? `Slack URL: ${summary.slackUrl}` : undefined],
+    summary,
+    title: "Mantis Slack Desktop Smoke",
   });
-  await runCommand({
-    command: "rsync",
-    args: [
-      "-az",
-      "-e",
-      sshArgs,
-      `${sshUser}@${host}:${params.remoteOutputDir}/slack-qa/`,
-      `${path.join(params.outputDir, "slack-qa")}/`,
-    ],
-    cwd: params.cwd,
-    env: params.env,
-    runner: params.runner,
-  }).catch(() => ({ stdout: "", stderr: "" }));
 }
 
 export async function runMantisSlackDesktopSmoke(
@@ -1386,37 +1017,8 @@ export async function runMantisSlackDesktopSmoke(
     "Mantis Slack desktop smoke output directory",
     { mode: 0o755 },
   );
-  const gatewaySetup = opts.gatewaySetup ?? false;
-  const approvalCheckpoints = opts.approvalCheckpoints ?? false;
-  if (approvalCheckpoints && gatewaySetup) {
-    throw new Error("--approval-checkpoints cannot be used with --gateway-setup.");
-  }
-  const scenarioIds = resolveScenarioIds({
-    approvalCheckpoints,
-    scenarioIds: opts.scenarioIds,
-  });
-  const hydrateMode =
-    normalizeHydrateMode(opts.hydrateMode) ??
-    normalizeHydrateMode(env[HYDRATE_MODE_ENV]) ??
-    DEFAULT_HYDRATE_MODE;
-  const artifactOwner = await root(outputDir, { symlinks: "reject" });
   const summaryPath = path.join(outputDir, "mantis-slack-desktop-smoke-summary.json");
   const reportPath = path.join(outputDir, "mantis-slack-desktop-smoke-report.md");
-  await clearSlackArtifacts(artifactOwner, [
-    path.basename(summaryPath),
-    path.basename(reportPath),
-    "error.txt",
-    "slack-desktop-smoke.png",
-    "slack-desktop-smoke.mp4",
-    "remote-metadata.json",
-    ...(approvalCheckpoints ? scenarioIds : []).flatMap((scenarioId) =>
-      (["pending", "resolved"] as const).flatMap((state) => [
-        `approval-checkpoints/${scenarioId}.${state}.json`,
-        `approval-checkpoints/${scenarioId}.${state}.ack.json`,
-        `approval-checkpoints/${scenarioId}-${state}.png`,
-      ]),
-    ),
-  ]);
   const crabboxBin = await resolveCrabboxBin({
     env,
     envName: CRABBOX_BIN_ENV,
@@ -1440,6 +1042,19 @@ export async function runMantisSlackDesktopSmoke(
   const alternateModel = trimToValue(opts.alternateModel) ?? primaryModel;
   const fastMode = opts.fastMode ?? true;
   const freshPr = trimToValue(opts.freshPr);
+  const hydrateMode =
+    normalizeHydrateMode(opts.hydrateMode) ??
+    normalizeHydrateMode(env[HYDRATE_MODE_ENV]) ??
+    DEFAULT_HYDRATE_MODE;
+  const gatewaySetup = opts.gatewaySetup ?? false;
+  const approvalCheckpoints = opts.approvalCheckpoints ?? false;
+  if (approvalCheckpoints && gatewaySetup) {
+    throw new Error("--approval-checkpoints cannot be used with --gateway-setup.");
+  }
+  const scenarioIds = resolveScenarioIds({
+    approvalCheckpoints,
+    scenarioIds: opts.scenarioIds,
+  });
   const slackChannelId =
     trimToValue(opts.slackChannelId) ??
     trimToValue(env[SLACK_CHANNEL_ID_ENV]) ??
@@ -1449,13 +1064,24 @@ export async function runMantisSlackDesktopSmoke(
   const runner = opts.commandRunner ?? defaultCommandRunner;
   const explicitLeaseId = trimToValue(opts.leaseId) ?? trimToValue(env[CRABBOX_LEASE_ID_ENV]);
   const keepLease = opts.keepLease ?? (gatewaySetup || isTruthyOptIn(env[CRABBOX_KEEP_ENV]));
-  const createdLease = explicitLeaseId === undefined;
+  const artifacts = await createSlackDesktopArtifactOwner({
+    outputDir,
+    approvalCheckpoints,
+    scenarioIds,
+  });
   const remoteOutputDir = `/tmp/openclaw-mantis-slack-desktop-${startedAt
     .toISOString()
-    .replace(/[^0-9A-Za-z]/gu, "-")}-${randomUUID()}`;
+    .replace(/[^0-9A-Za-z]/gu, "-")}-${artifacts.runId}`;
   let credentialLease: SlackGatewayCredentialLease | undefined;
   let leaseHeartbeat: SlackGatewayCredentialHeartbeat | undefined;
-  let leaseId = explicitLeaseId;
+  const session = createMantisCrabboxSession({
+    crabboxBin,
+    cwd: repoRoot,
+    env,
+    leaseId: explicitLeaseId,
+    provider,
+    runner,
+  });
   let summary: MantisSlackDesktopSmokeSummary | undefined;
   let screenshotPath: string | undefined;
   let slackQaDir: string | undefined;
@@ -1464,35 +1090,12 @@ export async function runMantisSlackDesktopSmoke(
   let approvalCheckpointArtifacts: MantisApprovalCheckpointArtifacts | undefined;
 
   try {
-    leaseId =
-      leaseId ??
+    const resolvedLeaseId =
+      session.leaseId ??
       (await timer.timePhase("crabbox.warmup", () =>
-        warmupCrabbox({
-          crabboxBin,
-          cwd: repoRoot,
-          env,
-          idleTimeout,
-          machineClass,
-          market,
-          provider,
-          runner,
-          ttl,
-        }),
+        session.acquire({ idleTimeout, machineClass, market, ttl }),
       ));
-    if (!leaseId) {
-      throw new Error("Crabbox lease id was not resolved.");
-    }
-    const resolvedLeaseId = leaseId;
-    const inspected = await timer.timePhase("crabbox.inspect", () =>
-      inspectCrabbox({
-        crabboxBin,
-        cwd: repoRoot,
-        env,
-        leaseId: resolvedLeaseId,
-        provider,
-        runner,
-      }),
-    );
+    const inspected = await timer.timePhase("crabbox.inspect", () => session.inspect());
     const preparedCredentialEnv = await timer.timePhase("credentials.prepare", () =>
       prepareGatewayCredentialEnv({
         credentialRole,
@@ -1552,28 +1155,23 @@ export async function runMantisSlackDesktopSmoke(
     );
     leaseHeartbeat?.throwIfFailed();
     await timer.timePhase("artifacts.copy", () =>
-      copyRemoteArtifacts({
+      copyCrabboxArtifacts({
         cwd: repoRoot,
         env,
         inspect: inspected,
-        outputDir,
+        outputDir: artifacts.stagingDir,
         remoteOutputDir,
         runner,
       }),
     );
-    await clearSlackArtifacts(artifactOwner, [
-      "error.txt",
-      path.basename(summaryPath),
-      path.basename(reportPath),
-    ]);
     screenshotPath = path.join(outputDir, "slack-desktop-smoke.png");
     videoPath = path.join(outputDir, "slack-desktop-smoke.mp4");
-    if (!(await pathExists(videoPath))) {
+    if (!(await artifacts.hasVideo())) {
       videoPath = undefined;
     }
-    remoteMetadata = await readRemoteMetadata(artifactOwner);
+    remoteMetadata = await artifacts.readMetadata();
     slackQaDir = path.join(outputDir, "slack-qa");
-    await assertNonEmptyFile(artifactOwner, "slack-desktop-smoke.png", "Slack desktop screenshot");
+    await artifacts.assertScreenshot();
     const gatewaySetupCompleted =
       gatewaySetup && remoteMetadata?.qaExitCode === 0 && remoteMetadata.gatewayAlive === true;
     const slackQaCompleted = !gatewaySetup && remoteMetadata?.qaExitCode === 0;
@@ -1584,7 +1182,7 @@ export async function runMantisSlackDesktopSmoke(
       timer.updatePhaseStatus("crabbox.remote_run", "accepted");
     }
     if (remoteRunError && !gatewaySetupCompleted && !slackQaCompleted) {
-      throw toErrorObject(remoteRunError);
+      throw toQaError(remoteRunError);
     }
     if (gatewaySetup && !gatewaySetupCompleted) {
       throw new Error("Slack desktop gateway setup did not report a live OpenClaw gateway.");
@@ -1596,13 +1194,7 @@ export async function runMantisSlackDesktopSmoke(
           : `Slack QA exited with code ${remoteMetadata.qaExitCode}.`;
       throw new Error(`${detail} See slack-desktop-command.log for details.`);
     }
-    approvalCheckpointArtifacts = await collectApprovalCheckpointArtifacts({
-      artifactOwner,
-      channelId: slackChannelId,
-      enabled: approvalCheckpoints,
-      outputDir,
-      scenarioIds,
-    });
+    approvalCheckpointArtifacts = await artifacts.collectCheckpoints();
     summary = {
       artifacts: {
         approvalCheckpoints: approvalCheckpointArtifacts,
@@ -1612,15 +1204,7 @@ export async function runMantisSlackDesktopSmoke(
         summaryPath,
         videoPath,
       },
-      crabbox: {
-        bin: crabboxBin,
-        createdLease,
-        id: resolvedLeaseId,
-        provider,
-        slug: inspected.slug,
-        state: inspected.state,
-        vncCommand: `${crabboxBin} vnc --provider ${provider} --id ${resolvedLeaseId} --open`,
-      },
+      crabbox: session.describe(inspected),
       finishedAt: new Date().toISOString(),
       hydrateMode: normalizeHydrateMode(remoteMetadata?.hydrateMode) ?? hydrateMode,
       outputDir,
@@ -1651,15 +1235,7 @@ export async function runMantisSlackDesktopSmoke(
         summaryPath,
         videoPath,
       },
-      crabbox: {
-        bin: crabboxBin,
-        createdLease,
-        id: leaseId ?? "unallocated",
-        provider,
-        vncCommand: leaseId
-          ? `${crabboxBin} vnc --provider ${provider} --id ${leaseId} --open`
-          : "unallocated",
-      },
+      crabbox: session.describe(),
       error: formatErrorMessage(error),
       finishedAt: new Date().toISOString(),
       hydrateMode,
@@ -1670,7 +1246,6 @@ export async function runMantisSlackDesktopSmoke(
       status: "fail",
       timings: timer.snapshot(),
     };
-    await artifactOwner.create("error.txt", `${summary.error}\n`);
     return {
       outputDir,
       reportPath,
@@ -1680,39 +1255,41 @@ export async function runMantisSlackDesktopSmoke(
       videoPath,
     };
   } finally {
-    await finalizeSlackRunActions([
-      async () => {
-        if (summary) {
-          summary.finishedAt = new Date().toISOString();
-          summary.timings = timer.snapshot();
-          await artifactOwner.create(path.basename(reportPath), renderReport(summary));
-          await artifactOwner.createJson(path.basename(summaryPath), summary, { space: 2 });
+    try {
+      try {
+        await artifacts.publish();
+      } finally {
+        await artifacts.cleanup();
+      }
+      if (summary) {
+        summary.finishedAt = new Date().toISOString();
+        summary.timings = timer.snapshot();
+        await artifacts.writeSummary(summary, renderReport(summary), summary.error);
+      }
+    } finally {
+      try {
+        if (session.createdLease && session.leaseId && !keepLease) {
+          await session.stop();
         }
-      },
-      async () => {
-        if (createdLease && leaseId && !keepLease) {
-          await stopCrabbox({ crabboxBin, cwd: repoRoot, env, leaseId, provider, runner });
+      } finally {
+        try {
+          if (leaseHeartbeat) {
+            await leaseHeartbeat.stop().catch((error: unknown) => {
+              console.warn(
+                `Slack credential heartbeat cleanup failed: ${formatErrorMessage(error)}`,
+              );
+            });
+          }
+        } finally {
+          if (credentialLease) {
+            await credentialLease.release().catch((error: unknown) => {
+              console.warn(`Slack credential release failed: ${formatErrorMessage(error)}`);
+            });
+          }
         }
-      },
-      async () => {
-        if (leaseHeartbeat) {
-          await leaseHeartbeat.stop().catch((error: unknown) => {
-            console.warn(`Slack credential heartbeat cleanup failed: ${formatErrorMessage(error)}`);
-          });
-        }
-      },
-      async () => {
-        if (credentialLease) {
-          await credentialLease.release().catch((error: unknown) => {
-            console.warn(`Slack credential release failed: ${formatErrorMessage(error)}`);
-          });
-        }
-      },
-    ]);
+      }
+    }
   }
 }
 
-function toErrorObject(error: unknown): Error {
-  return error instanceof Error ? error : new Error(formatErrorMessage(error));
-}
 /* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

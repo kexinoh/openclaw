@@ -82,7 +82,8 @@ class MainActivity : AppCompatActivity() {
         }
       } else {
         val appearanceThemeMode by currentViewModel.appearanceThemeMode.collectAsState()
-        OpenClawTheme(themeMode = appearanceThemeMode) {
+        val appearanceTextScale by currentViewModel.appearanceTextScale.collectAsState()
+        OpenClawTheme(themeMode = appearanceThemeMode, textScale = appearanceTextScale) {
           RootScreen(viewModel = currentViewModel)
         }
       }
@@ -231,6 +232,13 @@ class MainActivity : AppCompatActivity() {
   ) {
     if (intent?.isShareLaunchIntent() == true) {
       viewModel.handleShareLaunchIntent(intent)
+      return
+    }
+    parseConversationNotificationLaunchIntent(
+      intent = intent,
+      takeTarget = (application as NodeApp).conversationNotificationLaunchStore::take,
+    )?.let { target ->
+      viewModel.openConversationNotification(target)
       return
     }
     parseHomeDestinationIntent(intent)?.let { destination ->

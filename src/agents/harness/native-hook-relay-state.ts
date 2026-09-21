@@ -1,6 +1,7 @@
 import type { NativeHookRelaySharedState } from "./native-hook-relay-types.js";
 
 const NATIVE_HOOK_RELAY_STATE_SYMBOL = Symbol.for("openclaw.nativeHookRelay.state");
+export const MAX_NATIVE_HOOK_RELAY_INVOCATIONS = 200;
 
 function getNativeHookRelaySharedState(): NativeHookRelaySharedState {
   const globalRecord = globalThis as typeof globalThis & {
@@ -9,6 +10,7 @@ function getNativeHookRelaySharedState(): NativeHookRelaySharedState {
   globalRecord[NATIVE_HOOK_RELAY_STATE_SYMBOL] ??= {
     relays: new Map(),
     relayBridges: new Map(),
+    pendingOperations: new Set(),
     invocations: [],
     pendingPermissionApprovals: new Map(),
     pendingPreToolUseApprovals: new Map(),

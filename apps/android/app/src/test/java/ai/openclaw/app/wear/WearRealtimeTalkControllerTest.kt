@@ -4,9 +4,11 @@ import ai.openclaw.app.gateway.GatewayRequestRejected
 import ai.openclaw.app.gateway.GatewaySession
 import ai.openclaw.wear.shared.WearProtocol
 import ai.openclaw.wear.shared.WearRealtimeAudioFrameType
+import ai.openclaw.wear.shared.WearRealtimeTalkSnapshot
 import ai.openclaw.wear.shared.WearRealtimeTalkStatus
 import android.util.Base64
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
@@ -27,6 +29,126 @@ import org.robolectric.RobolectricTestRunner
 @RunWith(RobolectricTestRunner::class)
 class WearRealtimeTalkControllerTest {
   @Test
+  fun fullReplySurvivesBeyondTheWirePreview() =
+    runTest {
+      val controller = testTalkController()
+      assertTrue(controller.start("watch-a", "session-a", "attempt-a", "de"))
+      val text = "Grüße 👩🏽‍🚀".repeat(400) + "TRAILING SENTINEL"
+      controller.handleGatewayEvent(
+        "talk.event",
+        buildJsonObject {
+          put("relaySessionId", JsonPrimitive("relay-1"))
+          put("type", JsonPrimitive("transcript"))
+          put("role", JsonPrimitive("assistant"))
+          put("text", JsonPrimitive(text))
+          put("final", JsonPrimitive(true))
+        }.toString(),
+      )
+      try {
+        val entry =
+          controller.snapshot.value.conversation
+            .single()
+        assertTrue(entry.textTruncated)
+        assertTrue(entry.fullTextAvailable)
+        val first = controller.readReply("watch-a", "session-a", "attempt-a", entry.id, 0, null)
+        val second = controller.readReply("watch-a", "session-a", "attempt-a", entry.id, first.nextOffset!!, first.revision)
+        assertEquals(text, first.text + second.text)
+        assertEquals(
+          ai.openclaw.wear.shared.WearReplyTextStatus.Unavailable,
+          controller.readReply("watch-b", "session-a", "attempt-a", entry.id, 0, null).status,
+        )
+      } finally {
+        controller.stop("watch-a", "attempt-a")
+      }
+    }
+
+  @Test
+  fun replyPagesRejectRevisionsFromGrowthAndOwnersFromReplacedTalk() =
+    runTest {
+      val controller = testTalkController()
+      assertTrue(controller.start("watch-a", "session-a", "attempt-a", "de"))
+
+      fun emit(
+        text: String,
+        final: Boolean,
+      ) {
+        controller.handleGatewayEvent(
+          "talk.event",
+          buildJsonObject {
+            put("relaySessionId", JsonPrimitive("relay-1"))
+            put("type", JsonPrimitive("transcript"))
+            put("role", JsonPrimitive("assistant"))
+            put("text", JsonPrimitive(text))
+            put("final", JsonPrimitive(final))
+          }.toString(),
+        )
+      }
+      val text = "first ".repeat(1000)
+      emit(text, false)
+      val id =
+        controller.snapshot.value.conversation
+          .single()
+          .id
+      val first = controller.readReply("watch-a", "session-a", "attempt-a", id, 0, null)
+      val previewBefore =
+        controller.snapshot.value.conversation
+          .single()
+      emit(text + "TRAILING SENTINEL", true)
+      val previewAfter =
+        controller.snapshot.value.conversation
+          .single()
+      assertEquals(previewBefore.text, previewAfter.text)
+      assertTrue(previewAfter.textRevision > previewBefore.textRevision)
+      assertEquals(
+        id,
+        controller.snapshot.value.conversation
+          .single()
+          .id,
+      )
+      assertEquals(
+        ai.openclaw.wear.shared.WearReplyTextStatus.Changed,
+        controller.readReply("watch-a", "session-a", "attempt-a", id, first.nextOffset!!, first.revision).status,
+      )
+      val fresh = controller.readReply("watch-a", "session-a", "attempt-a", id, 0, null)
+      val tail = controller.readReply("watch-a", "session-a", "attempt-a", id, fresh.nextOffset!!, fresh.revision)
+      assertEquals(text + "TRAILING SENTINEL", fresh.text + tail.text)
+      controller.stop("watch-a", "attempt-a")
+      assertTrue(controller.start("watch-b", "session-b", "attempt-b", "de"))
+      assertEquals(
+        ai.openclaw.wear.shared.WearReplyTextStatus.Unavailable,
+        controller.readReply("watch-a", "session-a", "attempt-a", id, 0, null).status,
+      )
+      controller.stop("watch-b", "attempt-b")
+    }
+
+  @Test
+  fun oversizedTalkTextIsExplicitlyUnavailableRatherThanACompletePreview() =
+    runTest {
+      val controller = testTalkController()
+      assertTrue(controller.start("watch-a", "session-a", "attempt-a", "de"))
+      controller.handleGatewayEvent(
+        "talk.event",
+        buildJsonObject {
+          put("relaySessionId", JsonPrimitive("relay-1"))
+          put("type", JsonPrimitive("transcript"))
+          put("role", JsonPrimitive("assistant"))
+          put("text", JsonPrimitive("x".repeat(1_000_001)))
+          put("final", JsonPrimitive(true))
+        }.toString(),
+      )
+      val entry =
+        controller.snapshot.value.conversation
+          .single()
+      assertTrue(entry.textTruncated)
+      assertFalse(entry.fullTextAvailable)
+      assertEquals(
+        ai.openclaw.wear.shared.WearReplyTextStatus.TooLarge,
+        controller.readReply("watch-a", "session-a", "attempt-a", entry.id, 0, null).status,
+      )
+      controller.stop("watch-a", "attempt-a")
+    }
+
+  @Test
   fun `playback deadline counts only audio remaining after slow chunk delivery`() {
     val chunkBytes = WearProtocol.REALTIME_AUDIO_SAMPLE_RATE_HZ / 10 * 2
 
@@ -42,25 +164,16 @@ class WearRealtimeTalkControllerTest {
     runTest {
       var gatewayCalls = 0
       val controller =
-        WearRealtimeTalkController(
-          scope = this,
-          isConnected = { true },
+        testTalkController(
           requestGateway = { _, _, _ ->
             gatewayCalls += 1
             """{"relaySessionId":"relay-late"}"""
           },
-          sendGatewayFrame = { _, _, _, _ -> },
-          sendWatchFrame = { _, _, _ -> },
         )
 
       assertTrue(controller.stop("watch-a", "attempt-a"))
       assertFalse(
-        controller.start(
-          nodeId = "watch-a",
-          sessionKey = "session-a",
-          attemptId = "attempt-a",
-          language = "de",
-        ),
+        controller.start("watch-a", "session-a", "attempt-a", "de"),
       )
       assertEquals(0, gatewayCalls)
     }
@@ -69,12 +182,8 @@ class WearRealtimeTalkControllerTest {
   fun `partial scoped stop rejects when no active owner can match`() =
     runTest {
       val controller =
-        WearRealtimeTalkController(
-          scope = this,
-          isConnected = { true },
+        testTalkController(
           requestGateway = { _, _, _ -> """{"relaySessionId":"relay-late"}""" },
-          sendGatewayFrame = { _, _, _, _ -> },
-          sendWatchFrame = { _, _, _ -> },
         )
 
       assertFalse(controller.stop(nodeId = "watch-a"))
@@ -89,12 +198,8 @@ class WearRealtimeTalkControllerTest {
       val forcedChannelCloses = mutableListOf<String>()
       lateinit var controller: WearRealtimeTalkController
       controller =
-        WearRealtimeTalkController(
-          scope = this,
-          isConnected = { true },
+        testTalkController(
           requestGateway = { _, _, _ -> """{"ok":true}""" },
-          sendGatewayFrame = { _, _, _, _ -> },
-          sendWatchFrame = { _, _, _ -> },
           onSnapshot = { snapshot ->
             if (snapshot.status == WearRealtimeTalkStatus.CONNECTING) controller.abort()
           },
@@ -102,12 +207,7 @@ class WearRealtimeTalkControllerTest {
         )
 
       assertFalse(
-        controller.start(
-          nodeId = "watch-a",
-          sessionKey = "session-a",
-          attemptId = "attempt-a",
-          language = "de",
-        ),
+        controller.start("watch-a", "session-a", "attempt-a", "de"),
       )
       assertEquals(listOf("watch-a"), forcedChannelCloses)
       assertEquals(WearRealtimeTalkStatus.OFF, controller.snapshot.value.status)
@@ -123,8 +223,7 @@ class WearRealtimeTalkControllerTest {
       val gatewayMethods = mutableListOf<String>()
       val forcedChannelCloses = mutableListOf<String>()
       val controller =
-        WearRealtimeTalkController(
-          scope = this,
+        testTalkController(
           isConnected = { connected },
           requestGateway = { method, _, _ ->
             gatewayMethods += method
@@ -135,19 +234,12 @@ class WearRealtimeTalkControllerTest {
               """{"ok":true}"""
             }
           },
-          sendGatewayFrame = { _, _, _, _ -> },
-          sendWatchFrame = { _, _, _ -> },
           onForceCloseWatchChannel = { owner -> forcedChannelCloses += owner.nodeId },
         )
 
       val startResult =
         async {
-          controller.start(
-            nodeId = "watch-a",
-            sessionKey = "session-a",
-            attemptId = "attempt-a",
-            language = "de",
-          )
+          controller.start("watch-a", "session-a", "attempt-a", "de")
         }
       createStarted.await()
       connected = false
@@ -166,44 +258,18 @@ class WearRealtimeTalkControllerTest {
     runTest {
       val forcedChannelCloses = mutableListOf<String>()
       val controller =
-        WearRealtimeTalkController(
-          scope = this,
-          isConnected = { true },
-          requestGateway = { method, _, _ ->
-            if (method == "talk.session.create") {
-              """{"relaySessionId":"relay-1"}"""
-            } else {
-              """{"ok":true}"""
-            }
-          },
-          sendGatewayFrame = { _, _, _, _ -> },
-          sendWatchFrame = { _, _, _ -> },
+        testTalkController(
           onForceCloseWatchChannel = { owner -> forcedChannelCloses += owner.nodeId },
         )
 
       assertTrue(
-        controller.start(
-          nodeId = "watch-a",
-          sessionKey = "session-a",
-          attemptId = "attempt-a",
-          language = "de",
-        ),
+        controller.start("watch-a", "session-a", "attempt-a", "de"),
       )
       assertFalse(
-        controller.start(
-          nodeId = "watch-b",
-          sessionKey = "session-a",
-          attemptId = "attempt-b",
-          language = "de",
-        ),
+        controller.start("watch-b", "session-a", "attempt-b", "de"),
       )
       assertFalse(
-        controller.start(
-          nodeId = "watch-a",
-          sessionKey = "session-b",
-          attemptId = "attempt-b",
-          language = "de",
-        ),
+        controller.start("watch-a", "session-b", "attempt-b", "de"),
       )
 
       assertFalse(controller.stop("watch-b"))
@@ -218,9 +284,7 @@ class WearRealtimeTalkControllerTest {
       var staleAppendError: ((String) -> Unit)? = null
       var createCount = 0
       val controller =
-        WearRealtimeTalkController(
-          scope = this,
-          isConnected = { true },
+        testTalkController(
           requestGateway = { method, _, _ ->
             if (method == "talk.session.create") {
               createCount += 1
@@ -232,7 +296,6 @@ class WearRealtimeTalkControllerTest {
           sendGatewayFrame = { _, _, _, onError ->
             if (staleAppendError == null) staleAppendError = onError
           },
-          sendWatchFrame = { _, _, _ -> },
         )
 
       assertTrue(controller.start("watch-a", "session-a", "attempt-a", "de"))
@@ -256,9 +319,7 @@ class WearRealtimeTalkControllerTest {
       val releaseOutput = CompletableDeferred<Unit>()
       var createCount = 0
       val controller =
-        WearRealtimeTalkController(
-          scope = this,
-          isConnected = { true },
+        testTalkController(
           requestGateway = { method, _, _ ->
             if (method == "talk.session.create") {
               createCount += 1
@@ -267,7 +328,6 @@ class WearRealtimeTalkControllerTest {
               """{"ok":true}"""
             }
           },
-          sendGatewayFrame = { _, _, _, _ -> },
           sendWatchFrame = { _, _, _ ->
             outputStarted.complete(Unit)
             withContext(NonCancellable) {
@@ -305,9 +365,7 @@ class WearRealtimeTalkControllerTest {
     runTest {
       var createCount = 0
       val controller =
-        WearRealtimeTalkController(
-          scope = this,
-          isConnected = { true },
+        testTalkController(
           requestGateway = { method, _, _ ->
             if (method == "talk.session.create") {
               createCount += 1
@@ -316,8 +374,6 @@ class WearRealtimeTalkControllerTest {
               """{"ok":true}"""
             }
           },
-          sendGatewayFrame = { _, _, _, _ -> },
-          sendWatchFrame = { _, _, _ -> },
         )
       val staleOwner = WearRealtimeAttemptOwner("watch-a", "attempt-a", 1L)
       val replacementOwner = WearRealtimeAttemptOwner("watch-a", "attempt-b", 2L)
@@ -345,9 +401,7 @@ class WearRealtimeTalkControllerTest {
       val gatewayMethods = mutableListOf<String>()
       var createCount = 0
       val controller =
-        WearRealtimeTalkController(
-          scope = this,
-          isConnected = { true },
+        testTalkController(
           requestGateway = { method, _, _ ->
             gatewayMethods += method
             if (method == "talk.session.create") {
@@ -357,8 +411,6 @@ class WearRealtimeTalkControllerTest {
               """{"ok":true}"""
             }
           },
-          sendGatewayFrame = { _, _, _, _ -> },
-          sendWatchFrame = { _, _, _ -> },
         )
       val staleOwner = WearRealtimeAttemptOwner("watch-a", "attempt-a", 1L)
       val replacementOwner = WearRealtimeAttemptOwner("watch-a", "attempt-b", 2L)
@@ -409,9 +461,7 @@ class WearRealtimeTalkControllerTest {
       val oldToolResponse = CompletableDeferred<String>()
       var createCount = 0
       val controller =
-        WearRealtimeTalkController(
-          scope = this,
-          isConnected = { true },
+        testTalkController(
           requestGateway = { method, _, _ ->
             gatewayMethods += method
             when (method) {
@@ -419,15 +469,17 @@ class WearRealtimeTalkControllerTest {
                 createCount += 1
                 """{"relaySessionId":"relay-$createCount"}"""
               }
+
               "talk.client.toolCall" -> {
                 oldToolStarted.complete(Unit)
                 oldToolResponse.await()
               }
-              else -> """{"ok":true}"""
+
+              else -> {
+                """{"ok":true}"""
+              }
             }
           },
-          sendGatewayFrame = { _, _, _, _ -> },
-          sendWatchFrame = { _, _, _ -> },
         )
       val staleOwner = WearRealtimeAttemptOwner("watch-a", "attempt-a", 1L)
       val replacementOwner = WearRealtimeAttemptOwner("watch-a", "attempt-b", 2L)
@@ -475,9 +527,7 @@ class WearRealtimeTalkControllerTest {
     runTest {
       val createParams = mutableListOf<String?>()
       val controller =
-        WearRealtimeTalkController(
-          scope = this,
-          isConnected = { true },
+        testTalkController(
           requestGateway = { method, params, _ ->
             if (method != "talk.session.create") {
               """{"ok":true}"""
@@ -495,17 +545,10 @@ class WearRealtimeTalkControllerTest {
               """{"relaySessionId":"relay-legacy"}"""
             }
           },
-          sendGatewayFrame = { _, _, _, _ -> },
-          sendWatchFrame = { _, _, _ -> },
         )
 
       assertTrue(
-        controller.start(
-          nodeId = "watch-a",
-          sessionKey = "session-a",
-          attemptId = "attempt-a",
-          language = "de",
-        ),
+        controller.start("watch-a", "session-a", "attempt-a", "de"),
       )
 
       assertEquals(2, createParams.size)
@@ -521,9 +564,7 @@ class WearRealtimeTalkControllerTest {
     runTest {
       var createAttempts = 0
       val controller =
-        WearRealtimeTalkController(
-          scope = this,
-          isConnected = { true },
+        testTalkController(
           requestGateway = { method, _, _ ->
             if (method == "talk.session.create") {
               createAttempts += 1
@@ -536,17 +577,10 @@ class WearRealtimeTalkControllerTest {
             }
             """{"ok":true}"""
           },
-          sendGatewayFrame = { _, _, _, _ -> },
-          sendWatchFrame = { _, _, _ -> },
         )
 
       assertFalse(
-        controller.start(
-          nodeId = "watch-a",
-          sessionKey = "session-a",
-          attemptId = "attempt-a",
-          language = "de",
-        ),
+        controller.start("watch-a", "session-a", "attempt-a", "de"),
       )
       assertEquals(1, createAttempts)
     }
@@ -556,9 +590,7 @@ class WearRealtimeTalkControllerTest {
     runTest {
       val gatewayCalls = mutableListOf<Pair<String, String?>>()
       val controller =
-        WearRealtimeTalkController(
-          scope = this,
-          isConnected = { true },
+        testTalkController(
           requestGateway = { method, params, _ ->
             gatewayCalls += method to params
             when (method) {
@@ -567,16 +599,9 @@ class WearRealtimeTalkControllerTest {
               else -> """{"ok":true}"""
             }
           },
-          sendGatewayFrame = { _, _, _, _ -> },
-          sendWatchFrame = { _, _, _ -> },
         )
       assertTrue(
-        controller.start(
-          nodeId = "watch-a",
-          sessionKey = "session-a",
-          attemptId = "attempt-a",
-          language = "de",
-        ),
+        controller.start("watch-a", "session-a", "attempt-a", "de"),
       )
 
       controller.handleGatewayEvent(
@@ -646,30 +671,30 @@ class WearRealtimeTalkControllerTest {
       val toolCallResponse = CompletableDeferred<String>()
       val submittedResults = mutableListOf<String>()
       val controller =
-        WearRealtimeTalkController(
-          scope = this,
-          isConnected = { true },
+        testTalkController(
           requestGateway = { method, params, _ ->
             when (method) {
-              "talk.session.create" -> """{"relaySessionId":"relay-1"}"""
-              "talk.client.toolCall" -> toolCallResponse.await()
+              "talk.session.create" -> {
+                """{"relaySessionId":"relay-1"}"""
+              }
+
+              "talk.client.toolCall" -> {
+                toolCallResponse.await()
+              }
+
               "talk.session.submitToolResult" -> {
                 submittedResults += params.orEmpty()
                 """{"ok":true}"""
               }
-              else -> """{"ok":true}"""
+
+              else -> {
+                """{"ok":true}"""
+              }
             }
           },
-          sendGatewayFrame = { _, _, _, _ -> },
-          sendWatchFrame = { _, _, _ -> },
         )
       assertTrue(
-        controller.start(
-          nodeId = "watch-a",
-          sessionKey = "session-a",
-          attemptId = "attempt-a",
-          language = null,
-        ),
+        controller.start("watch-a", "session-a", "attempt-a", null),
       )
 
       controller.handleGatewayEvent(
@@ -701,9 +726,7 @@ class WearRealtimeTalkControllerTest {
     runTest {
       val gatewayCalls = mutableListOf<Pair<String, String?>>()
       val controller =
-        WearRealtimeTalkController(
-          scope = this,
-          isConnected = { true },
+        testTalkController(
           requestGateway = { method, params, _ ->
             gatewayCalls += method to params
             when (method) {
@@ -712,16 +735,9 @@ class WearRealtimeTalkControllerTest {
               else -> """{"ok":true}"""
             }
           },
-          sendGatewayFrame = { _, _, _, _ -> },
-          sendWatchFrame = { _, _, _ -> },
         )
       assertTrue(
-        controller.start(
-          nodeId = "watch-a",
-          sessionKey = "session-a",
-          attemptId = "attempt-a",
-          language = null,
-        ),
+        controller.start("watch-a", "session-a", "attempt-a", null),
       )
 
       controller.handleGatewayEvent(
@@ -754,26 +770,11 @@ class WearRealtimeTalkControllerTest {
     runTest {
       val output = mutableListOf<Pair<WearRealtimeAudioFrameType, ByteArray>>()
       val controller =
-        WearRealtimeTalkController(
-          scope = this,
-          isConnected = { true },
-          requestGateway = { method, _, _ ->
-            if (method == "talk.session.create") {
-              """{"relaySessionId":"relay-1"}"""
-            } else {
-              """{"ok":true}"""
-            }
-          },
-          sendGatewayFrame = { _, _, _, _ -> },
+        testTalkController(
           sendWatchFrame = { _, type, payload -> output += type to payload },
         )
       assertTrue(
-        controller.start(
-          nodeId = "watch-a",
-          sessionKey = "session-a",
-          attemptId = "attempt-a",
-          language = "de",
-        ),
+        controller.start("watch-a", "session-a", "attempt-a", "de"),
       )
       val audio =
         ByteArray(WearProtocol.MAX_REALTIME_AUDIO_FRAME_BYTES * 2 + 8) { index ->
@@ -821,17 +822,7 @@ class WearRealtimeTalkControllerTest {
     runTest {
       val output = mutableListOf<ByteArray>()
       val controller =
-        WearRealtimeTalkController(
-          scope = this,
-          isConnected = { true },
-          requestGateway = { method, _, _ ->
-            if (method == "talk.session.create") {
-              """{"relaySessionId":"relay-1"}"""
-            } else {
-              """{"ok":true}"""
-            }
-          },
-          sendGatewayFrame = { _, _, _, _ -> },
+        testTalkController(
           sendWatchFrame = { _, type, payload ->
             if (type == WearRealtimeAudioFrameType.OUTPUT_PCM) output += payload
           },
@@ -866,13 +857,7 @@ class WearRealtimeTalkControllerTest {
       val output = mutableListOf<ByteArray>()
       lateinit var controller: WearRealtimeTalkController
       controller =
-        WearRealtimeTalkController(
-          scope = this,
-          isConnected = { true },
-          requestGateway = { method, _, _ ->
-            if (method == "talk.session.create") """{"relaySessionId":"relay-1"}""" else """{"ok":true}"""
-          },
-          sendGatewayFrame = { _, _, _, _ -> },
+        testTalkController(
           sendWatchFrame = { _, type, payload ->
             if (type == WearRealtimeAudioFrameType.OUTPUT_PCM) {
               output += payload
@@ -906,13 +891,7 @@ class WearRealtimeTalkControllerTest {
       val releaseOutput = CompletableDeferred<Unit>()
       val forcedChannelCloses = mutableListOf<String>()
       val controller =
-        WearRealtimeTalkController(
-          scope = this,
-          isConnected = { true },
-          requestGateway = { method, _, _ ->
-            if (method == "talk.session.create") """{"relaySessionId":"relay-1"}""" else """{"ok":true}"""
-          },
-          sendGatewayFrame = { _, _, _, _ -> },
+        testTalkController(
           sendWatchFrame = { _, type, _ ->
             if (type == WearRealtimeAudioFrameType.OUTPUT_PCM) {
               outputStarted.complete(Unit)
@@ -947,18 +926,7 @@ class WearRealtimeTalkControllerTest {
     runTest {
       val forcedChannelCloses = mutableListOf<String>()
       val controller =
-        WearRealtimeTalkController(
-          scope = this,
-          isConnected = { true },
-          requestGateway = { method, _, _ ->
-            if (method == "talk.session.create") {
-              """{"relaySessionId":"relay-1"}"""
-            } else {
-              """{"ok":true}"""
-            }
-          },
-          sendGatewayFrame = { _, _, _, _ -> },
-          sendWatchFrame = { _, _, _ -> },
+        testTalkController(
           onForceCloseWatchChannel = { forcedChannelCloses += it.nodeId },
         )
       assertTrue(controller.start("watch-a", "session-a", "attempt-a", "de"))
@@ -978,9 +946,7 @@ class WearRealtimeTalkControllerTest {
       val gatewayMethods = mutableListOf<String>()
       val forcedChannelCloses = mutableListOf<String>()
       val controller =
-        WearRealtimeTalkController(
-          scope = this,
-          isConnected = { true },
+        testTalkController(
           requestGateway = { method, _, _ ->
             gatewayMethods += method
             if (method == "talk.session.create") {
@@ -989,17 +955,11 @@ class WearRealtimeTalkControllerTest {
               """{"ok":true}"""
             }
           },
-          sendGatewayFrame = { _, _, _, _ -> },
           sendWatchFrame = { _, _, _ -> error("wear link down") },
           onForceCloseWatchChannel = { owner -> forcedChannelCloses += owner.nodeId },
         )
       assertTrue(
-        controller.start(
-          nodeId = "watch-a",
-          sessionKey = "session-a",
-          attemptId = "attempt-a",
-          language = "de",
-        ),
+        controller.start("watch-a", "session-a", "attempt-a", "de"),
       )
 
       controller.handleGatewayEvent(
@@ -1020,6 +980,26 @@ class WearRealtimeTalkControllerTest {
       assertEquals(listOf("watch-a"), forcedChannelCloses)
     }
 }
+
+private fun CoroutineScope.testTalkController(
+  isConnected: () -> Boolean = { true },
+  requestGateway: suspend (String, String?, Long) -> String = { method, _, _ ->
+    if (method == "talk.session.create") """{"relaySessionId":"relay-1"}""" else """{"ok":true}"""
+  },
+  sendGatewayFrame: suspend (String, String?, Long, (String) -> Unit) -> Unit = { _, _, _, _ -> },
+  sendWatchFrame: suspend (WearRealtimeAttemptOwner, WearRealtimeAudioFrameType, ByteArray) -> Unit = { _, _, _ -> },
+  onSnapshot: (WearRealtimeTalkSnapshot) -> Unit = {},
+  onForceCloseWatchChannel: (WearRealtimeAttemptOwner) -> Unit = {},
+): WearRealtimeTalkController =
+  WearRealtimeTalkController(
+    scope = this,
+    isConnected = isConnected,
+    requestGateway = requestGateway,
+    sendGatewayFrame = sendGatewayFrame,
+    sendWatchFrame = sendWatchFrame,
+    onSnapshot = onSnapshot,
+    onForceCloseWatchChannel = onForceCloseWatchChannel,
+  )
 
 private suspend fun WearRealtimeTalkController.start(
   nodeId: String,

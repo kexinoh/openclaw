@@ -7,9 +7,13 @@ import {
 } from "../../../packages/gateway-protocol/src/client-info.js";
 import { PROTOCOL_VERSION } from "../../../packages/gateway-protocol/src/index.js";
 import type { createSubsystemLogger } from "../../logging/subsystem.js";
+import { runPluginHttpRoute } from "../../plugins/http-route-owner.js";
 import type { PluginHttpRouteRegistration, PluginRegistry } from "../../plugins/registry.js";
 import { withPluginRuntimeGatewayRequestScope } from "../../plugins/runtime/gateway-request-scope.js";
+import { rejectWebSocketUpgrade } from "../../shared/websocket-upgrade-reject.js";
+import { onUserProfilesChanged } from "../../state/user-profile-events.js";
 import { respondControlUiPluginAuthCookieProbe } from "../control-ui-plugin-auth-cookie.js";
+import { prepareGatewayRecipientProfile } from "../expected-profile.js";
 import { finishFailedGatewayHttpResponse } from "../http-common.js";
 import type { AuthorizedGatewayHttpRequest } from "../http-utils.js";
 import type { GatewayRequestContext, GatewayRequestOptions } from "../server-methods/types.js";
@@ -34,7 +38,10 @@ export {
   findRegisteredPluginHttpRoute,
   isRegisteredPluginHttpRoutePath,
 } from "./plugins-http/route-match.js";
-export { shouldEnforceGatewayAuthForPluginPath } from "./plugins-http/route-auth.js";
+export {
+  isPluginAuthenticatedRoutePath,
+  shouldEnforceGatewayAuthForPluginPath,
+} from "./plugins-http/route-auth.js";
 
 type SubsystemLogger = ReturnType<typeof createSubsystemLogger>;
 type PluginRouteRuntimeScope = Parameters<typeof withPluginRuntimeGatewayRequestScope>[0];
@@ -53,10 +60,15 @@ function resolvePluginRoutePathContextForRequest(
 function createPluginRouteRuntimeClient(
   scopes: readonly string[],
   clientIp: string | undefined,
+  requestAuth?: AuthorizedGatewayHttpRequest,
 ): GatewayRequestOptions["client"] {
-  return {
+  const authenticatedUserProfile = requestAuth?.authenticatedUserProfile;
+  const operatorRoleActor = requestAuth?.operatorRoleActor;
+  const client: NonNullable<GatewayRequestOptions["client"]> = {
     connId: `plugin-http:${clientIp ?? "unknown"}`,
     ...(clientIp ? { clientIp } : {}),
+    ...(authenticatedUserProfile ? { authenticatedUserProfile } : {}),
+    ...(operatorRoleActor ? { internal: { operatorRoleActor } } : {}),
     connect: {
       minProtocol: PROTOCOL_VERSION,
       maxProtocol: PROTOCOL_VERSION,
@@ -70,11 +82,25 @@ function createPluginRouteRuntimeClient(
       scopes: [...scopes],
     },
   };
+  prepareGatewayRecipientProfile(client);
+  return client;
 }
 
-function writeUpgradeUnauthorized(socket: Duplex) {
-  socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
-  socket.destroy();
+async function withPluginRouteRuntimeScope<T>(
+  scope: PluginRouteRuntimeScope,
+  run: () => Promise<T>,
+): Promise<T> {
+  // HTTP clients are not in the connected-client set. Keep their prepared role/aliases
+  // current across handler and projection awaits, using the same publication owner.
+  const client = scope.client;
+  const stop = client?.authenticatedUserProfile
+    ? onUserProfilesChanged(() => prepareGatewayRecipientProfile(client))
+    : undefined;
+  try {
+    return await withPluginRuntimeGatewayRequestScope(scope, run);
+  } finally {
+    stop?.();
+  }
 }
 
 type PluginRouteRuntimeDispatchContext = {
@@ -107,6 +133,7 @@ function canRunPluginHttpRouteWithoutAdmission(route: PluginHttpRouteRegistratio
 }
 
 function createPluginRouteRuntimeScope(params: {
+  registry: PluginRegistry;
   route: PluginHttpRouteRegistration;
   req: IncomingMessage;
   gatewayRequestContext?: GatewayRequestContext;
@@ -129,8 +156,13 @@ function createPluginRouteRuntimeScope(params: {
   const runtimeClient = createPluginRouteRuntimeClient(
     runtimeScopes,
     params.gatewayRequestClientIp,
+    params.route.auth === "gateway" ? params.gatewayRequestAuth : undefined,
   );
   return {
+    pluginRegistry: params.registry,
+    ...(params.route.auth === "gateway" && params.gatewayRequestAuth?.revalidate
+      ? { revalidate: params.gatewayRequestAuth.revalidate }
+      : {}),
     ...(params.gatewayRequestContext ? { context: params.gatewayRequestContext } : {}),
     client: runtimeClient,
     isWebchatConnect: () => false,
@@ -252,8 +284,9 @@ export function createGatewayPluginRequestHandler(params: {
       }
       try {
         const runRoute = async () =>
-          (await withPluginRuntimeGatewayRequestScope(
+          (await withPluginRouteRuntimeScope(
             createPluginRouteRuntimeScope({
+              registry,
               route,
               req,
               gatewayRequestContext,
@@ -261,7 +294,8 @@ export function createGatewayPluginRequestHandler(params: {
               gatewayRequestOperatorScopes,
               gatewayRequestClientIp: dispatchContext?.gatewayRequestClientIp,
             }),
-            async () => route.handler(req, res),
+            async () =>
+              runPluginHttpRoute(registry, route, route.handler, () => route.handler(req, res)),
           )) !== false;
         // Entitled trusted-operator routes delegate substantive work through Gateway dispatch.
         // An outer root would make gateway.suspend.prepare nested and permanently unreachable.
@@ -306,7 +340,7 @@ export function createGatewayPluginUpgradeHandler(params: {
     const requiresGatewayAuth = matchedPluginRoutesRequireGatewayAuth(matchedRoutes);
     if (requiresGatewayAuth && dispatchContext?.gatewayAuthSatisfied !== true) {
       log.warn(`plugin http upgrade blocked without gateway auth (${pathContext.canonicalPath})`);
-      writeUpgradeUnauthorized(socket);
+      rejectWebSocketUpgrade(socket, { status: 401 });
       return true;
     }
     const gatewayRequestAuth = dispatchContext?.gatewayRequestAuth;
@@ -321,7 +355,7 @@ export function createGatewayPluginUpgradeHandler(params: {
         log.warn(
           `plugin http upgrade blocked without ${missingRuntimeContext} (${pathContext.canonicalPath})`,
         );
-        writeUpgradeUnauthorized(socket);
+        rejectWebSocketUpgrade(socket, { status: 401 });
         return true;
       }
     }
@@ -331,8 +365,9 @@ export function createGatewayPluginUpgradeHandler(params: {
         const handled = await runWithGatewayUpgradeWorkAdmission(
           socket,
           async () =>
-            (await withPluginRuntimeGatewayRequestScope(
+            (await withPluginRouteRuntimeScope(
               createPluginRouteRuntimeScope({
+                registry,
                 route,
                 req,
                 gatewayRequestContext,
@@ -340,7 +375,12 @@ export function createGatewayPluginUpgradeHandler(params: {
                 gatewayRequestOperatorScopes,
                 gatewayRequestClientIp: dispatchContext?.gatewayRequestClientIp,
               }),
-              async () => route.handleUpgrade?.(req, socket, head),
+              async () => {
+                const handleUpgrade = route.handleUpgrade!;
+                return runPluginHttpRoute(registry, route, handleUpgrade, () =>
+                  handleUpgrade(req, socket, head),
+                );
+              },
             )) !== false,
         );
         if (handled) {
